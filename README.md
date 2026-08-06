@@ -10,6 +10,7 @@ camera's UVC extension unit (see [docs/protocol.md](docs/protocol.md)).
 
 ## Important: unofficial third-party software
 
+> [!CAUTION]
 > **This is unofficial third-party software.** OBSBOT Linux Control Center is
 > an independent community project. It is not affiliated with, endorsed,
 > sponsored, supported, or approved by OBSBOT.
@@ -19,6 +20,7 @@ their respective owners. No trademark ownership is claimed by this project.
 
 ## Caution: pre-release software
 
+> [!WARNING]
 > **This is a pre-release version and has not undergone security hardening.**
 
 Expect bugs and unfinished features. Review setup scripts before running them,
