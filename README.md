@@ -8,6 +8,23 @@ No kernel driver needed: video streams through the standard `uvcvideo`
 driver; this project drives everything else over V4L2 controls and the
 camera's UVC extension unit (see [docs/protocol.md](docs/protocol.md)).
 
+## Important: unofficial third-party software
+
+> **This is unofficial third-party software.** OBSBOT Linux Control Center is
+> an independent community project. It is not affiliated with, endorsed,
+> sponsored, supported, or approved by OBSBOT.
+
+OBSBOT, OBSBOT Center, product names, logos, and related trademarks belong to
+their respective owners. No trademark ownership is claimed by this project.
+
+## Caution: pre-release software
+
+> **This is a pre-release version and has not undergone security hardening.**
+
+Expect bugs and unfinished features. Review setup scripts before running them,
+do not expose the application to untrusted users, and do not rely on it for
+security-critical, privacy-critical, or production use.
+
 ## Components
 
 - **`obsbot-core`** — Rust library: device discovery, V4L2 controls,
