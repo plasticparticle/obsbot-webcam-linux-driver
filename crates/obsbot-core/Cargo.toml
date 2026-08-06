@@ -1,0 +1,9 @@
+[package]
+name = "obsbot-core"
+description = "Control library for OBSBOT cameras on Linux (V4L2 + UVC XU)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "0.2"

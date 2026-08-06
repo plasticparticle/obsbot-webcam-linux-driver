@@ -1,0 +1,38 @@
+OBSBOT Tiny 2 Lite: OBSBOT Tiny (usb-0000:2f:00.3-4.4.3):
+	/dev/video0
+	/dev/video1
+	/dev/media0
+
+Driver Info:
+	Driver name      : uvcvideo
+	Card type        : OBSBOT Tiny 2 Lite: OBSBOT Tiny
+	Bus info         : usb-0000:2f:00.3-4.4.3
+	Driver version   : 6.14.11
+	Capabilities     : 0x84a00001
+		Video Capture
+		Metadata Capture
+		Streaming
+		Extended Pix Format
+		Device Capabilities
+	Device Caps      : 0x04200001
+		Video Capture
+		Streaming
+		Extended Pix Format
+Media Driver Info:
+	Driver name      : uvcvideo
+	Model            : OBSBOT Tiny 2 Lite: OBSBOT Tiny
+	Serial           : 
+	Bus info         : usb-0000:2f:00.3-4.4.3
+	Media version    : 6.14.11
+	Hardware revision: 0x00000510 (1296)
+	Driver version   : 6.14.11
+Interface Info:
+	ID               : 0x03000002
+	Type             : V4L Video
+Entity Info:
+	ID               : 0x00000001 (1)
+	Name             : OBSBOT Tiny 2 Lite: OBSBOT Tiny
+	Function         : V4L2 I/O
+	Flags            : default
+	Pad 0x01000007   : 0: Sink
+	  Link 0x02000010: from remote pad 0x100000a of entity 'Extension 2' (Video Pixel Formatter): Data, Enabled, Immutable

@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["crates/obsbot-core", "crates/obsbot-cli", "crates/obsbot-gui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/plastic-reality/obsbot-linux"

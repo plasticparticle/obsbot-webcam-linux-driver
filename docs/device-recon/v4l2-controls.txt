@@ -1,0 +1,34 @@
+### /dev/video0
+
+== User Controls (class 0x00980001) ==
+0x00980900 Brightness                       int      min=0 max=100 step=1 def=50 cur=50
+0x00980901 Contrast                         int      min=0 max=100 step=1 def=50 cur=50
+0x00980902 Saturation                       int      min=0 max=100 step=1 def=50 cur=50
+0x00980903 Hue                              int      min=0 max=100 step=1 def=50 cur=50
+0x0098090c White Balance, Automatic         bool     min=0 max=1 step=1 def=1 cur=1
+0x0098090e Red Balance                      int      min=0 max=2048 step=1 def=1024 cur=1100 [inactive]
+0x0098090f Blue Balance                     int      min=0 max=2048 step=1 def=1024 cur=1210 [inactive]
+0x00980913 Gain                             int      min=1 max=64 step=1 def=1 cur=71
+0x00980918 Power Line Frequency             menu     min=0 max=2 step=1 def=3 cur=1
+    0: Disabled
+    1: 50 Hz
+    2: 60 Hz
+0x0098091a White Balance Temperature        int      min=2000 max=10000 step=100 def=5000 cur=7500 [inactive]
+0x0098091b Sharpness                        int      min=0 max=100 step=1 def=50 cur=50
+0x0098091c Backlight Compensation           int      min=0 max=18 step=1 def=9 cur=9
+
+== Camera Controls (class 0x009a0001) ==
+0x009a0901 Auto Exposure                    menu     min=0 max=3 step=1 def=0 cur=0
+    0: Auto Mode
+    1: Manual Mode
+    3: Aperture Priority Mode
+0x009a0902 Exposure Time, Absolute          int      min=1 max=2500 step=1 def=330 cur=330 [inactive]
+0x009a0908 Pan, Absolute                    int      min=-468000 max=468000 step=3600 def=0 cur=90000
+0x009a0909 Tilt, Absolute                   int      min=-324000 max=324000 step=3600 def=0 cur=-316800
+0x009a090a Focus, Absolute                  int      min=0 max=100 step=1 def=0 cur=0 [inactive]
+0x009a090c Focus, Automatic Continuous      bool     min=0 max=1 step=1 def=1 cur=1
+0x009a090d Zoom, Absolute                   int      min=0 max=100 step=1 def=0 cur=0
+0x009a090f Zoom, Continuous                 int      min=0 max=100 step=1 def=100 cur=245
+0x009a0920 Pan, Speed                       int      min=-1 max=80 step=1 def=10 cur=0
+0x009a0921 Tilt, Speed                      int      min=-1 max=120 step=1 def=20 cur=0
+### /dev/video1

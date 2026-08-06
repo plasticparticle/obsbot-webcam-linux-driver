@@ -1,0 +1,16 @@
+[package]
+name = "obsbot-cli"
+description = "Command-line control for OBSBOT cameras on Linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "obsbotctl"
+path = "src/main.rs"
+
+[dependencies]
+obsbot-core = { path = "../obsbot-core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
