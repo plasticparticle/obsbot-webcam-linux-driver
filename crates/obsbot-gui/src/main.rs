@@ -4,22 +4,17 @@
 //! no local server — everything talks straight to /dev/video*.
 
 mod effects;
+mod effects_ui;
+mod luts;
 mod preview;
+mod theme;
+mod widgets;
 
-use effects::{EffectsController, BACKGROUNDS, EYE_COLORS, RESOLUTIONS};
+use effects::{EffectsController, Group};
 use eframe::egui::{self, Color32, RichText, Stroke};
 use obsbot_core::{ctrl, AiMode, Device, Fov, TrackingSpeed};
 use preview::Preview;
-
-const BG: Color32 = Color32::from_rgb(10, 12, 20);
-const PANEL: Color32 = Color32::from_rgb(17, 20, 31);
-const CARD: Color32 = Color32::from_rgb(23, 27, 41);
-const CARD_BORDER: Color32 = Color32::from_rgb(42, 48, 68);
-const ACCENT: Color32 = Color32::from_rgb(116, 105, 255);
-const ACCENT_HOVER: Color32 = Color32::from_rgb(137, 127, 255);
-const TEXT_MUTED: Color32 = Color32::from_rgb(151, 158, 181);
-const SUCCESS: Color32 = Color32::from_rgb(67, 211, 145);
-const WARNING: Color32 = Color32::from_rgb(255, 184, 92);
+use theme::*;
 
 fn configure_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
@@ -33,7 +28,7 @@ fn configure_style(ctx: &egui::Context) {
     visuals.window_fill = PANEL;
     visuals.extreme_bg_color = Color32::from_rgb(13, 16, 25);
     visuals.faint_bg_color = Color32::from_rgb(28, 32, 47);
-    visuals.override_text_color = Some(Color32::from_rgb(231, 234, 244));
+    visuals.override_text_color = Some(TEXT);
     visuals.weak_text_color = Some(TEXT_MUTED);
     visuals.selection.bg_fill = ACCENT;
     visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
@@ -59,19 +54,7 @@ fn configure_style(ctx: &egui::Context) {
 }
 
 fn section(ui: &mut egui::Ui, icon: &str, title: &str, content: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::new()
-        .fill(CARD)
-        .stroke(Stroke::new(1.0_f32, CARD_BORDER))
-        .corner_radius(12)
-        .inner_margin(egui::Margin::symmetric(14, 12))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(icon).size(16.0).color(ACCENT_HOVER));
-                ui.label(RichText::new(title).size(15.0).strong());
-            });
-            ui.add_space(3.0);
-            content(ui);
-        });
+    widgets::card(ui, icon, title, |_| {}, content);
 }
 
 fn metric(ui: &mut egui::Ui, label: &str, value: String) {
@@ -130,6 +113,9 @@ struct App {
     state: CamState,
     preview: Preview,
     effects: EffectsController,
+    /// 0 = camera controls, 1 = effects.
+    panel: usize,
+    effects_tab: Group,
     last_poll: f64,
     error: Option<String>,
 }
@@ -142,7 +128,9 @@ impl App {
             dev: Device::discover().ok(),
             state: CamState::default(),
             preview: Preview::start(),
-            effects: EffectsController::default(),
+            effects: EffectsController::load(),
+            panel: 0,
+            effects_tab: Group::Looks,
             last_poll: -10.0,
             error: None,
         };
@@ -226,10 +214,26 @@ impl eframe::App for App {
                     .inner_margin(egui::Margin::symmetric(16, 14)),
             )
             .show(ctx, |ui| {
+                self.header_ui(ui);
+                if self.dev.is_none() {
+                    return;
+                }
                 egui::ScrollArea::vertical()
+                    .id_salt(self.panel)
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
-                        self.controls_ui(ui);
+                        if self.panel == 0 {
+                            self.controls_ui(ui);
+                        } else {
+                            let input = self.dev.as_ref().map(|device| device.path().to_path_buf());
+                            effects_ui::show(
+                                ui,
+                                &mut self.effects,
+                                &mut self.preview,
+                                input.as_deref(),
+                                &mut self.effects_tab,
+                            );
+                        }
                         ui.add_space(8.0);
                     });
             });
@@ -248,8 +252,14 @@ impl eframe::App for App {
                         ui.label(
                             RichText::new(if self.effects.enabled {
                                 format!(
-                                    "OBSBOT Virtual Camera  •  {} @ {} fps",
-                                    resolution.label, self.effects.fps
+                                    "{}  •  {} @ {} fps",
+                                    if self.effects.publishing {
+                                        "OBSBOT Virtual Camera"
+                                    } else {
+                                        "Effects preview"
+                                    },
+                                    resolution.label,
+                                    self.effects.fps
                                 )
                             } else {
                                 "OBSBOT Tiny 2 Lite  •  1280 × 720".to_owned()
@@ -259,18 +269,22 @@ impl eframe::App for App {
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        egui::Frame::new()
-                            .fill(Color32::from_rgb(22, 55, 45))
-                            .corner_radius(20)
-                            .inner_margin(egui::Margin::symmetric(10, 5))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new("●  LIVE").size(10.0).strong().color(SUCCESS),
-                                );
-                            });
+                        if self.dev.is_some() {
+                            widgets::status_pill(ui, "LIVE", SUCCESS);
+                        } else {
+                            widgets::status_pill(ui, "NO CAMERA", DANGER);
+                        }
                     });
                 });
-                ui.add_space(14.0);
+                ui.add_space(10.0);
+                let input = self.dev.as_ref().map(|device| device.path().to_path_buf());
+                effects_ui::active_chips(
+                    ui,
+                    &mut self.effects,
+                    &mut self.preview,
+                    input.as_deref(),
+                );
+                ui.add_space(4.0);
                 egui::Frame::new()
                     .fill(Color32::from_rgb(5, 7, 12))
                     .stroke(Stroke::new(1.0_f32, CARD_BORDER))
@@ -285,7 +299,8 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn controls_ui(&mut self, ui: &mut egui::Ui) {
+    /// Branding, connection status and the Camera / Effects switch.
+    fn header_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             egui::Frame::new()
                 .fill(ACCENT)
@@ -323,12 +338,15 @@ impl App {
             .corner_radius(10)
             .inner_margin(egui::Margin::symmetric(12, 9))
             .show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("●").color(if connected {
-                        SUCCESS
-                    } else {
-                        Color32::from_rgb(246, 105, 116)
-                    }));
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(12.0, 30.0), egui::Sense::hover());
+                    ui.painter().circle_filled(
+                        dot.center(),
+                        4.5,
+                        if connected { SUCCESS } else { DANGER },
+                    );
                     ui.vertical(|ui| {
                         ui.label(
                             RichText::new(if connected {
@@ -358,8 +376,22 @@ impl App {
         if !connected {
             return;
         }
+        ui.add_space(10.0);
+        let count = self.effects.settings.active().len();
+        let labels = [
+            "📷  Camera".to_owned(),
+            if count == 0 {
+                "✨  Effects".to_owned()
+            } else {
+                format!("✨  Effects  ·  {count}")
+            },
+        ];
+        widgets::segmented(ui, &labels, &mut self.panel);
+        ui.add_space(10.0);
+    }
+
+    fn controls_ui(&mut self, ui: &mut egui::Ui) {
         if let Some(err) = &self.error {
-            ui.add_space(8.0);
             egui::Frame::new()
                 .fill(Color32::from_rgb(55, 39, 24))
                 .corner_radius(8)
@@ -367,8 +399,8 @@ impl App {
                 .show(ui, |ui| {
                     ui.label(RichText::new(format!("⚠  {err}")).size(10.0).color(WARNING));
                 });
+            ui.add_space(10.0);
         }
-        ui.add_space(10.0);
 
         let sleeping = self.state.sleeping;
         if ui
@@ -376,9 +408,9 @@ impl App {
                 [ui.available_width(), 38.0],
                 egui::Button::new(
                     RichText::new(if sleeping {
-                        "⏻  Wake camera"
+                        "▶  Wake camera"
                     } else {
-                        "◐  Enter privacy mode"
+                        "🔒  Enter privacy mode"
                     })
                     .strong(),
                 )
@@ -391,10 +423,7 @@ impl App {
         }
         ui.add_space(10.0);
 
-        self.effects_ui(ui);
-        ui.add_space(10.0);
-
-        section(ui, "✦", "Gimbal", |ui| {
+        section(ui, "🎬", "Gimbal", |ui| {
             ui.columns(3, |cols| {
                 metric(&mut cols[0], "Pan", format!("{:.0}°", self.state.pan));
                 metric(&mut cols[1], "Tilt", format!("{:.0}°", self.state.tilt));
@@ -443,10 +472,10 @@ impl App {
                 }
                 ui.separator();
                 for (label, dp, dt) in [
-                    ("←", -3.0, 0.0),
-                    ("→", 3.0, 0.0),
-                    ("↑", 0.0, 3.0),
-                    ("↓", 0.0, -3.0),
+                    ("⬅", -3.0, 0.0),
+                    ("➡", 3.0, 0.0),
+                    ("⬆", 0.0, 3.0),
+                    ("⬇", 0.0, -3.0),
                 ] {
                     if ui.button(label).clicked() {
                         let pan = (self.state.pan + dp).clamp(-130.0, 130.0);
@@ -463,7 +492,7 @@ impl App {
         });
         ui.add_space(10.0);
 
-        section(ui, "◆", "Presets", |ui| {
+        section(ui, "⭐", "Presets", |ui| {
             ui.label(
                 RichText::new("Recall a saved camera position")
                     .size(10.0)
@@ -539,7 +568,7 @@ impl App {
         });
         ui.add_space(10.0);
 
-        section(ui, "◒", "Image", |ui| {
+        section(ui, "☀", "Image", |ui| {
             ui.horizontal(|ui| {
                 let mut hdr = self.state.hdr;
                 if ui.checkbox(&mut hdr, "HDR").changed() {
@@ -662,170 +691,22 @@ impl App {
             );
         });
     }
-
-    fn effects_ui(&mut self, ui: &mut egui::Ui) {
-        let input = self.dev.as_ref().map(|device| device.path().to_path_buf());
-        let mut restart = false;
-        let mut config_changed = false;
-        let mut toggle = false;
-
-        section(ui, "◉", "Virtual Camera & Effects", |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("OUTPUT").size(9.0).color(TEXT_MUTED));
-                egui::ComboBox::from_id_salt("effects-resolution")
-                    .selected_text(self.effects.selected_resolution().label)
-                    .show_ui(ui, |ui| {
-                        for (index, resolution) in RESOLUTIONS.iter().enumerate() {
-                            if ui
-                                .selectable_value(
-                                    &mut self.effects.resolution,
-                                    index,
-                                    resolution.label,
-                                )
-                                .changed()
-                            {
-                                restart = true;
-                            }
-                        }
-                    });
-                egui::ComboBox::from_id_salt("effects-fps")
-                    .selected_text(format!("{} fps", self.effects.fps))
-                    .show_ui(ui, |ui| {
-                        for fps in [15, 30] {
-                            if ui
-                                .selectable_value(&mut self.effects.fps, fps, format!("{fps} fps"))
-                                .changed()
-                            {
-                                restart = true;
-                            }
-                        }
-                    });
-            });
-
-            ui.separator();
-            ui.label(RichText::new("BACKGROUND").size(9.0).color(TEXT_MUTED));
-            ui.horizontal(|ui| {
-                for (index, label) in BACKGROUNDS.iter().enumerate() {
-                    if ui
-                        .add(egui::Button::new(*label).selected(self.effects.background == index))
-                        .clicked()
-                    {
-                        self.effects.background = index;
-                        config_changed = true;
-                    }
-                }
-            });
-            if self.effects.background == 1
-                && ui
-                    .add(egui::Slider::new(&mut self.effects.blur, 0.0..=1.0).text("Blur strength"))
-                    .changed()
-            {
-                config_changed = true;
-            }
-            if self.effects.background == 2 {
-                ui.label(RichText::new("IMAGE PATH").size(9.0).color(TEXT_MUTED));
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.effects.background_path)
-                            .hint_text("/home/me/Pictures/background.jpg")
-                            .desired_width(f32::INFINITY),
-                    )
-                    .changed()
-                {
-                    config_changed = true;
-                }
-            }
-
-            ui.separator();
-            ui.label(RichText::new("BEAUTY").size(9.0).color(TEXT_MUTED));
-            if ui
-                .add(
-                    egui::Slider::new(&mut self.effects.smoothing, 0.0..=1.0)
-                        .text("Skin softening"),
-                )
-                .changed()
-            {
-                config_changed = true;
-            }
-            if ui
-                .add(egui::Slider::new(&mut self.effects.slimming, 0.0..=1.0).text("Face slimming"))
-                .changed()
-            {
-                config_changed = true;
-            }
-            if ui
-                .add(egui::Slider::new(&mut self.effects.skin_tone, -1.0..=1.0).text("Skin tone"))
-                .changed()
-            {
-                config_changed = true;
-            }
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("EYE COLOR").size(9.0).color(TEXT_MUTED));
-                egui::ComboBox::from_id_salt("eye-color")
-                    .selected_text(EYE_COLORS[self.effects.eye_color])
-                    .show_ui(ui, |ui| {
-                        for (index, color) in EYE_COLORS.iter().enumerate() {
-                            if ui
-                                .selectable_value(&mut self.effects.eye_color, index, *color)
-                                .changed()
-                            {
-                                config_changed = true;
-                            }
-                        }
-                    });
-            });
-
-            if let Some(message) = &self.effects.message {
-                ui.label(
-                    RichText::new(message)
-                        .size(10.0)
-                        .color(if self.effects.enabled {
-                            SUCCESS
-                        } else {
-                            WARNING
-                        }),
-                );
-            }
-            if ui
-                .add_sized(
-                    [ui.available_width(), 36.0],
-                    egui::Button::new(if self.effects.enabled {
-                        "■  Stop virtual camera"
-                    } else {
-                        "▶  Start virtual camera"
-                    })
-                    .selected(self.effects.enabled),
-                )
-                .clicked()
-            {
-                toggle = true;
-            }
-        });
-
-        if toggle {
-            if self.effects.enabled {
-                self.effects.stop(&mut self.preview);
-            } else if let Some(input) = input.as_deref() {
-                if let Err(error) = self.effects.start(input, &mut self.preview) {
-                    self.effects.message = Some(error);
-                }
-            }
-        } else if restart {
-            if let Some(input) = input.as_deref() {
-                if let Err(error) = self.effects.restart(input, &mut self.preview) {
-                    self.effects.message = Some(error);
-                }
-            }
-        } else if config_changed {
-            if let Err(error) = self.effects.write_config() {
-                self.effects.message = Some(format!("Could not update effects: {error}"));
-            }
-        }
-    }
 }
 
 impl Drop for App {
     fn drop(&mut self) {
         self.effects.stop(&mut self.preview);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Icons used in this file must exist in the bundled fonts.
+    #[test]
+    fn camera_panel_icons_have_glyphs() {
+        let icons = [
+            "📷", "✨", "▶", "🔒", "🎬", "⭐", "◎", "☀", "⟲", "⚠", "⬅", "➡", "⬆", "⬇",
+        ];
+        assert_eq!(crate::widgets::missing_glyphs(&icons), Vec::<&str>::new());
     }
 }

@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This repository is a Rust 2021 workspace. `crates/obsbot-core/` contains device discovery, V4L2 controls, and the UVC extension-unit protocol. `crates/obsbot-cli/` builds the `obsbotctl` command-line client, while `crates/obsbot-gui/` builds the native egui control center and its preview capture thread. Protocol notes live in `docs/protocol.md`; raw device observations belong in `docs/device-recon/`. Treat `target/` as generated output and do not commit it.
+This repository is a Rust 2021 workspace. `crates/obsbot-core/` contains device discovery, V4L2 controls, and the UVC extension-unit protocol. `crates/obsbot-cli/` builds the `obsbotctl` command-line client, while `crates/obsbot-gui/` builds the native egui control center and its preview capture thread. `effects/` holds the Python worker that renders filters into the virtual camera (`processor.py` plus one module per effect family); the GUI drives it through a `key=value` settings file, so effect names must match between `crates/obsbot-gui/src/effects.rs` and the worker. The effects pipeline is documented in `docs/effects.md`. Protocol notes live in `docs/protocol.md`; raw device observations belong in `docs/device-recon/`. Treat `target/` as generated output and do not commit it.
 
 ## Build, Test, and Development Commands
 

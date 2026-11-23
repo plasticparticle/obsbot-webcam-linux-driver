@@ -58,6 +58,10 @@ parity with the official OBSBOT Center (Windows/macOS only).
 ### Linux-native extras (beyond OBSBOT Center)
 - [x] CLI (`obsbotctl`) with full feature coverage — scriptable
 - [x] Live preview in the GUI
+- [x] Effects with live preview: colour looks and LUTs, studio lighting,
+      beauty, stickers, distortions, face paint, anonymiser,
+      expression-triggered effects, background blur/replace
+- [x] Virtual camera output for other apps (needs `v4l2loopback`)
 - [ ] Profiles (e.g. "meeting", "streaming") switchable via CLI/hotkey
 - [ ] System tray quick controls
 - [ ] D-Bus API so other tools (Stream Deck, OBS scripts) can drive the camera

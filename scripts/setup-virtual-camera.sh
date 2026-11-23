@@ -13,6 +13,15 @@ if lsmod | grep -q '^v4l2loopback '; then
   exit 1
 fi
 
+if ! modinfo v4l2loopback >/dev/null 2>&1; then
+  echo "The v4l2loopback kernel module is not installed." >&2
+  echo "Install it for your distribution, then run this script again:" >&2
+  echo "  Arch:          sudo pacman -S v4l2loopback-dkms linux-headers" >&2
+  echo "  Debian/Ubuntu: sudo apt install v4l2loopback-dkms" >&2
+  echo "  Fedora:        sudo dnf install v4l2loopback (RPM Fusion)" >&2
+  exit 1
+fi
+
 sudo modprobe v4l2loopback \
   devices=1 \
   video_nr=42 \

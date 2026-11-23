@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import struct
 import subprocess
 import sys
 import time
@@ -14,16 +16,85 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
+import beauty
+import masks
+import stickers
+from landmarks import Face, LandmarkSmoother
+from lighting import Lights
+from looks import Grader
+from privacy import Anonymiser
+from triggers import Triggers
+from warp import WarpField, distort, reshape_face
+
 
 @dataclass
 class Settings:
     background: str = "off"
     background_path: str = ""
     blur: float = 0.55
+    look: str = "none"
+    look_strength: float = 1.0
+    lut: str = ""
+    lut_strength: float = 1.0
+    grain: float = 0.0
+    vignette: float = 0.0
+    glow: float = 0.0
     smoothing: float = 0.0
     slimming: float = 0.0
     skin_tone: float = 0.0
     eye_color: str = "natural"
+    eye_brighten: float = 0.0
+    eye_size: float = 0.0
+    nose_slim: float = 0.0
+    lip_color: str = "none"
+    lip_strength: float = 0.6
+    blush: float = 0.0
+    teeth: float = 0.0
+    stickers: tuple[str, ...] = ()
+    distortion: str = "none"
+    distortion_strength: float = 0.6
+    mask: str = "none"
+    mask_strength: float = 1.0
+    triggers: tuple[str, ...] = ()
+    anonymise: str = "off"
+    anonymise_style: str = "pixel"
+    anonymise_amount: float = 0.5
+    light_key: float = 0.0
+    light_x: float = -0.5
+    light_y: float = 0.5
+    light_warmth: float = 0.0
+    light_fill: float = 0.0
+    light_rim: float = 0.0
+    light_rim_color: str = "white"
+    light_dim: float = 0.0
+
+
+_UNIT_FIELDS = ("look_strength", "grain", "vignette", "glow", "smoothing", "slimming", "eye_brighten",
+                "eye_size", "nose_slim", "lip_strength", "blush", "teeth", "distortion_strength",
+                "mask_strength", "blur", "lut_strength", "anonymise_amount", "light_key", "light_fill", "light_rim", "light_dim")
+_SIGNED_FIELDS = ("skin_tone", "light_x", "light_y", "light_warmth")
+_NAME_FIELDS = ("background", "background_path", "look", "eye_color", "lip_color", "distortion", "mask",
+                "light_rim_color", "lut", "anonymise", "anonymise_style")
+_LIST_FIELDS = ("stickers", "triggers")
+
+
+def parse_settings(text: str) -> Settings:
+    """Parse `key=value` lines; unknown keys and bad values fall back to defaults."""
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key.strip()] = value.strip()
+    settings = Settings()
+    for name in _UNIT_FIELDS:
+        setattr(settings, name, clamp_float(values.get(name), getattr(settings, name)))
+    for name in _SIGNED_FIELDS:
+        setattr(settings, name, clamp_float(values.get(name), getattr(settings, name), -1.0, 1.0))
+    for name in _NAME_FIELDS:
+        setattr(settings, name, values.get(name, getattr(settings, name)))
+    for name in _LIST_FIELDS:
+        setattr(settings, name, tuple(item.strip() for item in values.get(name, "").split(",") if item.strip()))
+    return settings
 
 
 class ConfigFile:
@@ -37,20 +108,7 @@ class ConfigFile:
             stat = self.path.stat()
             if stat.st_mtime_ns == self.mtime_ns:
                 return self.settings
-            values: dict[str, str] = {}
-            for line in self.path.read_text(encoding="utf-8").splitlines():
-                key, separator, value = line.partition("=")
-                if separator:
-                    values[key.strip()] = value.strip()
-            self.settings = Settings(
-                background=values.get("background", "off"),
-                background_path=values.get("background_path", ""),
-                blur=clamp_float(values.get("blur"), 0.55),
-                smoothing=clamp_float(values.get("smoothing"), 0.0),
-                slimming=clamp_float(values.get("slimming"), 0.0),
-                skin_tone=clamp_float(values.get("skin_tone"), 0.0, -1.0, 1.0),
-                eye_color=values.get("eye_color", "natural"),
-            )
+            self.settings = parse_settings(self.path.read_text(encoding="utf-8"))
             self.mtime_ns = stat.st_mtime_ns
         except (OSError, ValueError):
             pass
@@ -81,6 +139,7 @@ class VisionModels:
                 base_options=base(model_asset_path=str(model_dir / "face_landmarker.task")),
                 running_mode=vision.RunningMode.VIDEO,
                 num_faces=1,
+                output_face_blendshapes=True,
                 min_face_detection_confidence=0.45,
                 min_face_presence_confidence=0.45,
                 min_tracking_confidence=0.45,
@@ -153,34 +212,95 @@ class Effects:
         self.last_mask: np.ndarray | None = None
         self.background_path = ""
         self.background_image: np.ndarray | None = None
-        grid_y, grid_x = np.indices((height, width), dtype=np.float32)
-        self.grid_x = grid_x
-        self.grid_y = grid_y
+        self.field = WarpField(width, height)
+        self.grader = Grader(width, height)
+        self.triggers = Triggers(width, height)
+        self.smoother = LandmarkSmoother()
+        self.lights = Lights(width, height)
+        self.anonymiser = Anonymiser()
+        self.last_depth: np.ndarray | None = None
+        self.last_time_s: float | None = None
+        # None while no enabled effect needs a face.
+        self.face_found: bool | None = None
+
+    def detect_face(self, mp_image, timestamp_ms: int) -> Face | None:
+        result = self.models.landmarker.detect_for_video(mp_image, timestamp_ms)
+        if not result.face_landmarks:
+            self.smoother.reset()
+            return None
+        landmarks = result.face_landmarks[0]
+        points = np.array([(p.x * self.width, p.y * self.height) for p in landmarks], np.float32)
+        depth = np.array([p.z * self.width for p in landmarks], np.float32)
+        if self.last_depth is not None and self.last_depth.shape == depth.shape:
+            depth = self.last_depth + (depth - self.last_depth) * 0.4
+        self.last_depth = depth
+        shapes = {}
+        if result.face_blendshapes:
+            shapes = {category.category_name: category.score for category in result.face_blendshapes[0]}
+        return Face(self.smoother.update(points), shapes, depth)
 
     def apply(self, frame: np.ndarray, settings: Settings, timestamp_ms: int) -> np.ndarray:
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+        time_s = timestamp_ms / 1000.0
+        dt = 0.0 if self.last_time_s is None else min(0.25, time_s - self.last_time_s)
+        self.last_time_s = time_s
+        mp_image = None
 
-        landmarks = None
-        needs_face = any(
-            (settings.smoothing > 0.01, abs(settings.skin_tone) > 0.01,
-             settings.slimming > 0.01, settings.eye_color != "natural")
-        )
+        retouch = (settings.smoothing > 0.01 or abs(settings.skin_tone) > 0.01
+                   or settings.eye_color != "natural" or settings.eye_brighten > 0.01
+                   or (settings.lip_color != "none" and settings.lip_strength > 0.01)
+                   or settings.blush > 0.01 or settings.teeth > 0.01)
+        reshape = settings.slimming > 0.01 or settings.nose_slim > 0.01 or settings.eye_size > 0.01
+        distortion = settings.distortion != "none" and settings.distortion_strength > 0.01
+        paint = settings.mask != "none" and settings.mask_strength > 0.01
+        lit = (settings.light_key > 0.01 or settings.light_fill > 0.01
+               or settings.light_rim > 0.01 or settings.light_dim > 0.01)
+        # Lights use the person mask so they fall on you, not on the wall behind.
+        needs_mask = settings.background != "off" or lit
+        hidden = settings.anonymise in ("eyes", "face")
+        needs_face = bool(retouch or reshape or distortion or paint or settings.stickers or settings.triggers
+                          or hidden
+                          or settings.light_key > 0.01 or settings.light_fill > 0.01)
+
+        face = None
+        if needs_face or needs_mask:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
         if needs_face:
-            result = self.models.landmarker.detect_for_video(mp_image, timestamp_ms)
-            if result.face_landmarks:
-                landmarks = result.face_landmarks[0]
+            face = self.detect_face(mp_image, timestamp_ms)
+            self.face_found = face is not None
+        else:
+            self.face_found = None
+            self.smoother.reset()
 
-        if landmarks and settings.slimming > 0.01:
-            frame = self.slim_face(frame, landmarks, settings.slimming)
+        # 1. Paint on the untouched face so makeup follows any later reshaping.
+        if face is not None:
+            if settings.smoothing > 0.01 or abs(settings.skin_tone) > 0.01:
+                beauty.skin(frame, face, settings.smoothing, settings.skin_tone)
+            if settings.teeth > 0.01:
+                beauty.whiten_teeth(frame, face, settings.teeth)
+            if settings.lip_color != "none" and settings.lip_strength > 0.01:
+                beauty.tint_lips(frame, face, settings.lip_color, settings.lip_strength)
+            if settings.blush > 0.01:
+                beauty.blush(frame, face, settings.blush)
+            if settings.eye_brighten > 0.01:
+                beauty.brighten_eyes(frame, face, settings.eye_brighten)
+            if settings.eye_color != "natural":
+                beauty.recolor_eyes(frame, face, settings.eye_color)
+            if paint:
+                masks.apply(frame, face, settings.mask, settings.mask_strength)
 
-        if landmarks and (settings.smoothing > 0.01 or abs(settings.skin_tone) > 0.01):
-            frame = self.skin_effects(frame, landmarks, settings.smoothing, settings.skin_tone)
+        # 2. Reshape: beauty tweaks and funny distortions share one resample.
+        self.field.reset()
+        if face is not None and (reshape or distortion):
+            reshape_face(self.field, face, settings.slimming, settings.nose_slim, settings.eye_size)
+            if distortion:
+                distort(self.field, face, settings.distortion, settings.distortion_strength)
+            frame = self.field.apply(frame)
+            face = face.moved(self.field.move_points(face.pts))
 
-        if landmarks and settings.eye_color != "natural":
-            frame = self.recolor_eyes(frame, landmarks, settings.eye_color)
-
-        if settings.background != "off":
+        # 3. Background and lights, using a person mask that went through the same reshape.
+        person = None
+        if needs_mask:
             segment = self.models.segmenter.segment_for_video(mp_image, timestamp_ms)
             if segment.confidence_masks:
                 mask = segment.confidence_masks[0].numpy_view()
@@ -190,21 +310,46 @@ class Effects:
                 if self.last_mask is not None:
                     mask = 0.68 * self.last_mask + 0.32 * mask
                 self.last_mask = mask
-                frame = self.composite_background(frame, mask, settings)
+                person = self.field.apply(mask, cv2.BORDER_REPLICATE)
         else:
             self.last_mask = None
-        return frame
+        if person is not None and settings.background != "off":
+            frame = self.composite_background(frame, person, settings)
+        if lit:
+            frame = self.lights.apply(frame, face, person, settings.light_key, settings.light_x,
+                                      settings.light_y, settings.light_warmth, settings.light_fill,
+                                      settings.light_rim, settings.light_rim_color, settings.light_dim)
+
+        # 4. Anonymise late, so nothing drawn earlier can show through, then
+        #    add the things that sit on top of the picture.
+        if hidden:
+            self.anonymiser.apply(frame, face, settings.anonymise, settings.anonymise_style,
+                                  settings.anonymise_amount, dt)
+        else:
+            self.anonymiser.reset()
+        if face is not None and settings.stickers:
+            stickers.draw_all(frame, face, settings.stickers, time_s)
+        if settings.triggers or self.triggers.busy:
+            self.triggers.update(face, settings.triggers, dt, time_s)
+            self.triggers.draw(frame, face, time_s)
+
+        # 5. The grade goes last so stickers and backgrounds share the look.
+        return self.grader.apply(frame, settings.look, settings.look_strength,
+                                 settings.grain, settings.vignette, settings.glow,
+                                 settings.lut, settings.lut_strength)
 
     def composite_background(self, frame: np.ndarray, mask: np.ndarray, settings: Settings) -> np.ndarray:
         if settings.background == "image" and settings.background_path:
             background = self.load_background(settings.background_path)
         else:
-            sigma = 5.0 + settings.blur * 24.0
-            background = cv2.GaussianBlur(frame, (0, 0), sigma)
+            # Blur a quarter-size copy: same look, a fraction of the cost.
+            sigma = (5.0 + settings.blur * 24.0) * self.width / 1280.0
+            small = cv2.resize(frame, (self.width // 4, self.height // 4), interpolation=cv2.INTER_AREA)
+            small = cv2.GaussianBlur(small, (0, 0), max(0.8, sigma / 4.0))
+            background = cv2.resize(small, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
         if background is None:
             return frame
-        alpha = mask[..., None]
-        return np.clip(frame * alpha + background * (1.0 - alpha), 0, 255).astype(np.uint8)
+        return cv2.blendLinear(frame, background, mask, 1.0 - mask)
 
     def load_background(self, path: str) -> np.ndarray | None:
         if path == self.background_path:
@@ -222,89 +367,40 @@ class Effects:
         self.background_image = resized[y:y + self.height, x:x + self.width].copy()
         return self.background_image
 
-    def points(self, landmarks) -> np.ndarray:
-        return np.array([(p.x * self.width, p.y * self.height) for p in landmarks], np.float32)
 
-    def face_mask(self, landmarks) -> np.ndarray:
-        points = self.points(landmarks)
-        oval = np.array(
-            [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397,
-             365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58,
-             132, 93, 234, 127, 162, 21, 54, 103, 67, 109],
-            dtype=np.int32,
-        )
-        mask = np.zeros((self.height, self.width), np.uint8)
-        cv2.fillConvexPoly(mask, points[oval].astype(np.int32), 255)
-        return cv2.GaussianBlur(mask, (0, 0), max(2.0, self.width / 320.0)).astype(np.float32) / 255.0
+class PreviewStream:
+    """Sends finished frames to the control center over the worker's stdout.
 
-    def skin_effects(self, frame: np.ndarray, landmarks, smoothing: float, tone: float) -> np.ndarray:
-        mask = self.face_mask(landmarks)[..., None]
-        result = frame.astype(np.float32)
-        if smoothing > 0.01:
-            filtered = cv2.bilateralFilter(frame, 0, 18.0 + 35.0 * smoothing, 7.0 + 18.0 * smoothing)
-            detail = frame.astype(np.float32) - cv2.GaussianBlur(frame, (0, 0), 1.4).astype(np.float32)
-            softened = filtered.astype(np.float32) + detail * (0.35 - 0.25 * smoothing)
-            amount = mask * (0.15 + 0.65 * smoothing)
-            result = result * (1.0 - amount) + softened * amount
-        if abs(tone) > 0.01:
-            lab = cv2.cvtColor(np.clip(result, 0, 255).astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
-            lab[..., 0] += tone * 8.0 * mask[..., 0]
-            lab[..., 1] += tone * 7.0 * mask[..., 0]
-            lab[..., 2] += tone * 10.0 * mask[..., 0]
-            toned = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
-            result = toned.astype(np.float32)
-        return np.clip(result, 0, 255).astype(np.uint8)
+    Each frame is `b"OBSF"`, little-endian u32 width and height, then RGB bytes.
+    """
 
-    def slim_face(self, frame: np.ndarray, landmarks, amount: float) -> np.ndarray:
-        points = self.points(landmarks)
-        center = points[1]
-        result = frame
-        for index in (234, 454):
-            cheek = points[index]
-            target = cheek + (center - cheek) * (0.055 + 0.11 * amount)
-            radius = max(30.0, np.linalg.norm(cheek - center) * 0.9)
-            result = self.local_warp(result, cheek, target, radius, amount)
-        return result
+    MAX_WIDTH = 1280
 
-    def local_warp(self, frame: np.ndarray, source: np.ndarray, target: np.ndarray,
-                   radius: float, amount: float) -> np.ndarray:
-        distance_sq = (self.grid_x - target[0]) ** 2 + (self.grid_y - target[1]) ** 2
-        weight = np.clip(1.0 - distance_sq / (radius * radius), 0.0, 1.0) ** 2
-        dx, dy = (target - source) * amount
-        map_x = self.grid_x - dx * weight
-        map_y = self.grid_y - dy * weight
-        return cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
+    def __init__(self):
+        # Keep the real stdout for frames; anything else that prints goes to stderr.
+        self.pipe = os.fdopen(os.dup(1), "wb", buffering=0)
+        os.dup2(2, 1)
 
-    def recolor_eyes(self, frame: np.ndarray, landmarks, color_name: str) -> np.ndarray:
-        colors = {
-            "blue": (108, 68, 28),
-            "green": (62, 82, 35),
-            "hazel": (35, 78, 105),
-            "gray": (105, 100, 94),
-            "violet": (110, 55, 92),
-        }
-        color = colors.get(color_name)
-        if color is None:
-            return frame
-        points = self.points(landmarks)
-        overlay = frame.copy()
-        mask = np.zeros((self.height, self.width), np.uint8)
-        for indices in ([469, 470, 471, 472], [474, 475, 476, 477]):
-            if max(indices) >= len(points):
-                continue
-            iris = points[indices]
-            center = iris.mean(axis=0)
-            radius = max(2, int(np.max(np.linalg.norm(iris - center, axis=1))))
-            cv2.circle(mask, tuple(center.astype(int)), radius, 255, -1, cv2.LINE_AA)
-        if not np.any(mask):
-            return frame
-        luminance = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32) / 150.0
-        tint = np.zeros_like(frame)
-        tint[:] = color
-        tinted = tint.astype(np.float32) * np.clip(luminance[..., None], 0.35, 1.45)
-        alpha = (cv2.GaussianBlur(mask, (0, 0), 1.0).astype(np.float32) / 255.0 * 0.58)[..., None]
-        overlay = overlay.astype(np.float32) * (1.0 - alpha) + tinted * alpha
-        return np.clip(overlay, 0, 255).astype(np.uint8)
+    def send(self, frame: np.ndarray) -> None:
+        height, width = frame.shape[:2]
+        if width > self.MAX_WIDTH:
+            height = round(height * self.MAX_WIDTH / width)
+            width = self.MAX_WIDTH
+            frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        self.pipe.write(b"OBSF" + struct.pack("<II", width, height))
+        self.pipe.write(memoryview(np.ascontiguousarray(rgb)).cast("B"))
+
+
+def write_status(path: Path, fps: float, frame_ms: float, face_found: bool | None) -> None:
+    """Publish worker health for the control center; best effort."""
+    face = "none" if face_found is None else ("yes" if face_found else "no")
+    try:
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(f"fps={fps:.1f}\nframe_ms={frame_ms:.1f}\nface={face}\n", encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError:
+        pass
 
 
 def open_capture(path: str, width: int, height: int, fps: int) -> cv2.VideoCapture:
@@ -326,8 +422,10 @@ def open_capture(path: str, width: int, height: int, fps: int) -> cv2.VideoCaptu
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--output", help="V4L2 loopback device to publish to")
+    parser.add_argument("--preview", action="store_true", help="write frames to stdout")
     parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--status", type=Path)
     parser.add_argument("--model-dir", required=True, type=Path)
     parser.add_argument("--width", required=True, type=int)
     parser.add_argument("--height", required=True, type=int)
@@ -337,17 +435,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    preview = PreviewStream() if args.preview else None
     models = VisionModels(args.model_dir)
     effects = Effects(args.width, args.height, models)
     config = ConfigFile(args.config)
     capture = open_capture(args.input, args.width, args.height, args.fps)
     start = time.monotonic()
-    frames = 0
-    sink = VirtualCameraSink(args.output, args.width, args.height, args.fps)
+    window_start = start
+    window_frames = 0
+    window_busy = 0.0
+    sink = VirtualCameraSink(args.output, args.width, args.height, args.fps) if args.output else None
     last_timestamp_ms = -1
     next_frame_at = time.monotonic()
     try:
-        print(f"virtual camera ready: {args.output}", flush=True)
+        print(f"effects worker ready (publishing to {args.output or 'preview only'})",
+              file=sys.stderr, flush=True)
         while True:
             ok, frame = capture.read()
             if not ok:
@@ -358,16 +460,28 @@ def main() -> int:
                 frame = cv2.resize(frame, (args.width, args.height), interpolation=cv2.INTER_AREA)
             timestamp_ms = max(last_timestamp_ms + 1, int((time.monotonic() - start) * 1000))
             last_timestamp_ms = timestamp_ms
+            began = time.monotonic()
             processed = effects.apply(frame, config.refresh(), timestamp_ms)
-            sink.send(processed)
-            frames += 1
+            if sink is not None:
+                sink.send(processed)
+            if preview is not None:
+                preview.send(processed)
+            now = time.monotonic()
+            window_frames += 1
+            window_busy += now - began
+            if args.status is not None and now - window_start >= 1.0:
+                write_status(args.status, window_frames / (now - window_start),
+                             1000.0 * window_busy / window_frames, effects.face_found)
+                window_start, window_frames, window_busy = now, 0, 0.0
             next_frame_at += 1.0 / args.fps
             time.sleep(max(0.0, next_frame_at - time.monotonic()))
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, BrokenPipeError):
+        # A closed preview pipe means the control center went away.
         return 0
     finally:
         capture.release()
-        sink.close()
+        if sink is not None:
+            sink.close()
         models.close()
 
 
