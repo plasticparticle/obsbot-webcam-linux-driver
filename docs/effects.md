@@ -34,6 +34,16 @@ visible in the app's preview only (the panel shows **PREVIEW** rather than
 `output=` and `fps=` in the settings file belong to the GUI (the worker takes
 them as command-line arguments); the worker ignores them.
 
+## Profiles
+
+A profile is a snapshot of every effect setting, stored as
+`profiles/<name>.conf` next to `effects.conf` in the same `key=value` format
+(without `output=` and `fps=`, which stay per machine). Applying one copies it
+over the live settings, which then reach the worker like any other edit. The
+GUI shows a profile as selected whenever the live settings equal it exactly.
+Starter profiles are written only when the folder does not exist yet, so
+deleting them is permanent. See `crates/obsbot-gui/src/profiles.rs`.
+
 ## Settings keys
 
 Amounts are `0..1` unless noted. Names must match between
@@ -91,6 +101,11 @@ is deliberate:
 | `stickers.py` | Where each sprite sits relative to the head |
 | `triggers.py` | Expression-triggered particles, rainbow and storm cloud |
 | `luts/generate.py` | Regenerates the bundled `.cube` files from formulas |
+
+GUI side (`crates/obsbot-gui/src/`): `effects.rs` holds the catalogue,
+settings and worker control; `effects_ui.rs` the panel; `profiles.rs` saved
+profiles; `luts.rs` the LUT library; `widgets.rs` the custom controls;
+`preview.rs` the live view.
 
 ## Design notes
 

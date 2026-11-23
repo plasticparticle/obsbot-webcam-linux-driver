@@ -84,6 +84,16 @@ default. Settings are saved to
 `$XDG_CONFIG_HOME/obsbot-control-center/effects.conf` and restored on the next
 launch.
 
+**Profiles:** the Profiles card at the top of the Effects panel stores every
+effect setting under a name. Click a profile to switch to it, or press
+**Ctrl+1** … **Ctrl+9** anywhere in the window for the first nine (in
+alphabetical order). **Save as…** stores the current settings; after tweaking
+an applied profile you can **Update** or **Revert** it; an unmodified profile
+can be deleted. Four starters (Incognito, Meeting, Party, Studio) are created
+on first launch. Profiles are plain files in
+`$XDG_CONFIG_HOME/obsbot-control-center/profiles/`, so they are easy to back
+up or share.
+
 **LUTs:** the Looks tab lists the bundled LUTs from `effects/luts/` and any
 3D `.cube` file you add with **Add LUT…**, by pasting a path, or by dropping
 it into `$XDG_CONFIG_HOME/obsbot-control-center/luts/` (**Open folder**).

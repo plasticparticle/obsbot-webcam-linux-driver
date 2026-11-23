@@ -456,6 +456,36 @@ pub fn light_pad(ui: &mut Ui, x: &mut f32, y: &mut f32, lamp: [u8; 3], lit: bool
     changed
 }
 
+/// A selectable pill, used for profiles.
+pub fn pill(ui: &mut Ui, text: &str, selected: bool) -> Response {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        FontId::proportional(12.0),
+        if selected { Color32::WHITE } else { TEXT },
+    );
+    let size = Vec2::new(galley.size().x + 24.0, 28.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, true, selected, text));
+    if ui.is_rect_visible(rect) {
+        let t = ui.ctx().animate_bool_responsive(response.id, selected);
+        let base = if response.hovered() { TILE_HOVER } else { TILE };
+        let painter = ui.painter();
+        painter.rect_filled(rect, 14.0, mix(base, ACCENT, t));
+        painter.rect_stroke(
+            rect,
+            14.0,
+            Stroke::new(1.0_f32, mix(CARD_BORDER, ACCENT_HOVER, t)),
+            StrokeKind::Inside,
+        );
+        painter.galley(
+            Pos2::new(rect.left() + 12.0, rect.center().y - galley.size().y / 2.0),
+            galley,
+            TEXT,
+        );
+    }
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
 /// A removable pill. Returns true when its remove button was clicked.
 pub fn chip(ui: &mut Ui, text: &str) -> bool {
     let font = FontId::proportional(11.0);

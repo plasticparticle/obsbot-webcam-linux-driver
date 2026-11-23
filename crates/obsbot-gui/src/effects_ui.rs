@@ -7,10 +7,11 @@ use crate::effects::{
 };
 use crate::luts::LutLibrary;
 use crate::preview::Preview;
+use crate::profiles::{ProfileStore, MAX_NAME_CHARS, SHORTCUTS};
 use crate::theme::*;
 use crate::widgets::{
-    amount, caption, card, chip, color_dot, grid, hint, icon_tile, light_pad, link, segmented,
-    status_pill, swatch_tile, tab_bar, toggle,
+    amount, caption, card, chip, color_dot, grid, hint, icon_tile, light_pad, link, pill,
+    segmented, status_pill, swatch_tile, tab_bar, toggle,
 };
 use eframe::egui::{self, RichText, Sense, Ui, Vec2};
 use std::path::Path;
@@ -28,6 +29,8 @@ pub fn show(
     let mut restart = false;
 
     camera_card(ui, effects, &mut power, &mut restart);
+    ui.add_space(10.0);
+    profiles_card(ui, &mut effects.settings, &mut effects.profiles);
     ui.add_space(10.0);
 
     let tabs: Vec<(&str, &str, usize)> = Group::ALL
@@ -120,6 +123,138 @@ pub fn active_chips(
         return;
     }
     effects.settings_changed(input, preview);
+}
+
+/// Saved sets of every effect setting, one click (or Ctrl+number) away.
+fn profiles_card(ui: &mut Ui, settings: &mut EffectSettings, store: &mut ProfileStore) {
+    let selected = store.matching(settings).map(|profile| profile.name.clone());
+    let mut open_naming = false;
+    let can_save_as = store.draft.is_none() && selected.is_none();
+    card(
+        ui,
+        "💾",
+        "Profiles",
+        |ui| {
+            if can_save_as {
+                open_naming = link(ui, "Save as…")
+                    .on_hover_text("Save every current effect setting as a profile")
+                    .clicked();
+            }
+        },
+        |ui| {
+            if store.profiles.is_empty() && store.draft.is_none() {
+                hint(
+                    ui,
+                    "Set up your effects, then choose “Save as…” to get back to them with one click.",
+                );
+            }
+            let mut apply: Option<usize> = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                for (index, profile) in store.profiles.iter().enumerate() {
+                    let active = selected.as_deref() == Some(profile.name.as_str());
+                    let response = pill(ui, &profile.name, active);
+                    let response = if index < SHORTCUTS {
+                        response.on_hover_text(format!("Ctrl+{}", index + 1))
+                    } else {
+                        response
+                    };
+                    if response.clicked() {
+                        apply = Some(index);
+                    }
+                }
+            });
+            if let Some(index) = apply {
+                let profile = &store.profiles[index];
+                *settings = profile.settings.clone();
+                store.current = Some(profile.name.clone());
+                store.confirm_delete = None;
+                store.message = None;
+            }
+
+            if let Some(draft) = &mut store.draft {
+                let mut save = false;
+                let mut cancel = false;
+                ui.horizontal(|ui| {
+                    cancel = link(ui, "Cancel").clicked();
+                    save = ui.button("Save").clicked();
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(draft)
+                            .hint_text("Profile name")
+                            .char_limit(MAX_NAME_CHARS)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                        save = true;
+                    }
+                    if std::mem::take(&mut store.focus_draft) {
+                        edit.request_focus();
+                    }
+                });
+                if save {
+                    let name = draft.clone();
+                    match store.save(&name, settings) {
+                        Ok(saved) => {
+                            store.draft = None;
+                            store.message = Some((format!("Saved “{saved}”."), false));
+                        }
+                        Err(error) => store.message = Some((error, true)),
+                    }
+                } else if cancel {
+                    store.draft = None;
+                    store.message = None;
+                }
+            } else if let Some(name) = &selected {
+                // Showing a saved profile untouched: the only thing left to do is delete it.
+                let confirming = store.confirm_delete.as_deref() == Some(name.as_str());
+                let label = if confirming {
+                    format!("Click again to delete “{name}”")
+                } else {
+                    format!("Delete “{name}”")
+                };
+                if link(ui, &label).clicked() {
+                    if confirming {
+                        store.confirm_delete = None;
+                        store.message = Some(match store.delete(name) {
+                            Ok(()) => (format!("Deleted “{name}”."), false),
+                            Err(error) => (error, true),
+                        });
+                    } else {
+                        store.confirm_delete = Some(name.clone());
+                    }
+                }
+            } else if let Some(name) = store
+                .current
+                .clone()
+                .filter(|name| store.find(name).is_some())
+            {
+                // A profile was applied and then tweaked.
+                store.confirm_delete = None;
+                ui.horizontal(|ui| {
+                    hint(ui, &format!("“{name}” has unsaved changes."));
+                    if link(ui, "Update").clicked() {
+                        store.message = Some(match store.save(&name, settings) {
+                            Ok(saved) => (format!("Updated “{saved}”."), false),
+                            Err(error) => (error, true),
+                        });
+                    }
+                    if link(ui, "Revert").clicked() {
+                        if let Some(profile) = store.find(&name) {
+                            *settings = profile.settings.clone();
+                        }
+                    }
+                });
+            }
+            if let Some((text, is_error)) = &store.message {
+                message(ui, text, if *is_error { WARNING } else { SUCCESS });
+            }
+        },
+    );
+    if open_naming {
+        store.draft = Some(String::new());
+        store.focus_draft = true;
+        store.message = None;
+    }
 }
 
 fn camera_card(ui: &mut Ui, effects: &mut EffectsController, power: &mut bool, restart: &mut bool) {
@@ -668,6 +803,7 @@ mod tests {
                     assert!(!output.shapes.is_empty());
                 }
                 assert_eq!(tab, group);
+                assert!(effects.profiles.current.is_none());
                 assert_eq!(
                     effects.settings, settings,
                     "rendering must not edit settings"
@@ -675,6 +811,38 @@ mod tests {
                 assert!(!effects.enabled);
             }
         }
+    }
+
+    /// The Profiles card in each of its states: empty, naming, showing a
+    /// saved profile, and showing one with unsaved changes.
+    #[test]
+    fn profiles_card_renders_in_every_state() {
+        let ctx = egui::Context::default();
+        let dir = std::env::temp_dir().join(format!("obsbot-ui-profiles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = ProfileStore::load(dir.clone(), true);
+        let mut settings = EffectSettings::default();
+        let mut draw = |settings: &mut EffectSettings, store: &mut ProfileStore| {
+            for _ in 0..2 {
+                let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default()
+                        .show(ctx, |ui| profiles_card(ui, settings, store));
+                });
+            }
+        };
+        draw(&mut settings, &mut store);
+        store.draft = Some("Evening".into());
+        draw(&mut settings, &mut store);
+        store.draft = None;
+        settings = store.find("Party").unwrap().settings.clone();
+        store.current = Some("Party".into());
+        draw(&mut settings, &mut store);
+        assert_eq!(store.matching(&settings).unwrap().name, "Party");
+        settings.grain = 0.5;
+        draw(&mut settings, &mut store);
+        assert!(store.matching(&settings).is_none());
+        assert_eq!(store.profiles.len(), 4, "drawing must not save or delete");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Every icon must exist in the bundled fonts, or tiles would show blanks.
@@ -687,7 +855,7 @@ mod tests {
         icons.extend(TRIGGERS.iter().map(|c| c.icon));
         icons.extend(Group::ALL.iter().map(|g| g.icon()));
         icons.extend(LIGHT_PRESETS.iter().map(|p| p.icon));
-        icons.extend(["🎥", "✔", "✖", "↺"]);
+        icons.extend(["🎥", "✔", "✖", "↺", "💾"]);
 
         let missing = crate::widgets::missing_glyphs(&icons);
         assert!(missing.is_empty(), "icons without a glyph: {missing:?}");

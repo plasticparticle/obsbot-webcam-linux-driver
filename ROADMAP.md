@@ -62,7 +62,9 @@ parity with the official OBSBOT Center (Windows/macOS only).
       beauty, stickers, distortions, face paint, anonymiser,
       expression-triggered effects, background blur/replace
 - [x] Virtual camera output for other apps (needs `v4l2loopback`)
-- [ ] Profiles (e.g. "meeting", "streaming") switchable via CLI/hotkey
+- [x] Effect profiles: save, update and switch whole filter set-ups
+      (Ctrl+1 … Ctrl+9)
+- [ ] Camera profiles (gimbal, image settings) switchable via CLI/hotkey
 - [ ] System tray quick controls
 - [ ] D-Bus API so other tools (Stream Deck, OBS scripts) can drive the camera
 - [x] Hot-plug handling (udev)

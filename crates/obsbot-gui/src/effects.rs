@@ -3,6 +3,7 @@
 
 use crate::luts::LutLibrary;
 use crate::preview::Preview;
+use crate::profiles::ProfileStore;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -1043,6 +1044,7 @@ pub struct EffectsController {
     pub notice: Option<Notice>,
     pub status: Option<WorkerStatus>,
     pub luts: LutLibrary,
+    pub profiles: ProfileStore,
     process: Option<Child>,
     config_path: PathBuf,
     status_path: PathBuf,
@@ -1055,10 +1057,10 @@ pub struct EffectsController {
 impl EffectsController {
     /// Restore the settings from the last session, if any.
     pub fn load() -> Self {
-        Self::from_file(config_path())
+        Self::from_file(config_path(), true)
     }
 
-    fn from_file(config_path: PathBuf) -> Self {
+    fn from_file(config_path: PathBuf, seed_profiles: bool) -> Self {
         let text = fs::read_to_string(&config_path).unwrap_or_default();
         let values = parse_lines(&text);
         let resolution = values
@@ -1085,6 +1087,7 @@ impl EffectsController {
                 repository_root().join("effects/luts"),
                 config_path.with_file_name("luts"),
             ),
+            profiles: ProfileStore::load(config_path.with_file_name("profiles"), seed_profiles),
             process: None,
             config_path,
             status_path: std::env::temp_dir()
@@ -1149,6 +1152,17 @@ impl EffectsController {
     pub fn stop_by_user(&mut self, preview: &mut Preview) {
         self.stop(preview);
         self.autostart_blocked = true;
+    }
+
+    /// Switch to the saved profile at `index` (as listed), if there is one.
+    pub fn apply_profile(&mut self, index: usize, input: Option<&Path>, preview: &mut Preview) {
+        let Some(profile) = self.profiles.profiles.get(index) else {
+            return;
+        };
+        self.settings = profile.settings.clone();
+        self.profiles.current = Some(profile.name.clone());
+        self.profiles.message = None;
+        self.settings_changed(input, preview);
     }
 
     /// Start (or restart) the worker. Errors are also stored in `notice`.
@@ -1306,7 +1320,8 @@ fn find_virtual_camera() -> Option<PathBuf> {
 impl EffectsController {
     /// A controller that never touches the user's saved settings.
     pub fn for_tests() -> Self {
-        Self::from_file(std::env::temp_dir().join("obsbot-effects-tests-unused.conf"))
+        let dir = std::env::temp_dir().join(format!("obsbot-effects-tests-{}", std::process::id()));
+        Self::from_file(dir.join("unused.conf"), false)
     }
 }
 

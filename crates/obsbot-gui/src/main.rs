@@ -7,6 +7,7 @@ mod effects;
 mod effects_ui;
 mod luts;
 mod preview;
+mod profiles;
 mod theme;
 mod widgets;
 
@@ -193,6 +194,28 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.effects.poll(&mut self.preview);
+        // Ctrl+1 … Ctrl+9 switch effect profiles from anywhere in the window.
+        const DIGITS: [egui::Key; profiles::SHORTCUTS] = [
+            egui::Key::Num1,
+            egui::Key::Num2,
+            egui::Key::Num3,
+            egui::Key::Num4,
+            egui::Key::Num5,
+            egui::Key::Num6,
+            egui::Key::Num7,
+            egui::Key::Num8,
+            egui::Key::Num9,
+        ];
+        let picked = ctx.input_mut(|input| {
+            DIGITS
+                .iter()
+                .position(|key| input.consume_key(egui::Modifiers::COMMAND, *key))
+        });
+        if let (Some(index), Some(device)) = (picked, &self.dev) {
+            let input = device.path().to_path_buf();
+            self.effects
+                .apply_profile(index, Some(&input), &mut self.preview);
+        }
         // Reconnect / periodic status poll.
         let now = ctx.input(|i| i.time);
         if self.dev.is_none() && now - self.last_poll > 2.0 {
