@@ -17,6 +17,16 @@ struct Cli {
 enum Command {
     /// Show current gimbal, zoom, AI and image settings
     Status,
+    /// Control a running OBSBOT Control Center (try `obsbotctl app help`)
+    ///
+    /// Examples: `app brb`, `app freeze`, `app privacy toggle`,
+    /// `app effects off`, `app profile Meeting`, `app profile next`,
+    /// `app position Whiteboard`, `app show`, `app status`.
+    App {
+        /// The command and its arguments
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        words: Vec<String>,
+    },
     /// Set pan angle in degrees (-130..130)
     Pan {
         #[arg(allow_hyphen_values = true)]
@@ -159,12 +169,23 @@ fn main() -> Result<()> {
     // Die quietly when piped into `head` etc. instead of panicking.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let cli = Cli::parse();
+    if let Command::App { words } = &cli.command {
+        // Talks to the app, not the camera, so no device is opened.
+        let reply = obsbot_core::app_ipc::send(&words.join(" "))
+            .context("the OBSBOT Control Center is not running")?;
+        if let Some(problem) = reply.strip_prefix("error: ") {
+            bail!("{problem}");
+        }
+        println!("{reply}");
+        return Ok(());
+    }
     let dev = match &cli.device {
         Some(path) => Device::open(path).with_context(|| format!("opening {path}"))?,
         None => Device::discover().context("discovering OBSBOT camera")?,
     };
 
     match cli.command {
+        Command::App { .. } => unreachable!("handled before the camera is opened"),
         Command::Status => {
             println!("device:   {} ({})", dev.path().display(), dev.card());
             println!("pan:      {:+.1}°", dev.pan_deg()?);

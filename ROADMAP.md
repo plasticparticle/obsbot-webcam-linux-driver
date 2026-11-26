@@ -32,7 +32,7 @@ parity with the official OBSBOT Center (Windows/macOS only).
 - [x] Human tracking on/off
 - [x] Tracking modes: standard / upper body / close-up / headroom, desk mode
 - [x] Tracking speed (slow / standard / fast)
-- [ ] Auto-framing / auto-zoom
+- [x] Auto-framing / auto-zoom (digital, in the effects worker)
 - [ ] Gesture control toggles (target select, dynamic zoom)
 
 ### Image
@@ -44,7 +44,7 @@ parity with the official OBSBOT Center (Windows/macOS only).
 - [x] Brightness / contrast / saturation / sharpness / hue
 - [x] Field of view selection (wide / medium / narrow)
 - [x] Focus: auto / manual, face-priority AF
-- [ ] Mirror / flip
+- [x] Mirror / flip (in the effects worker)
 - [ ] Image style presets
 
 ### Device
@@ -52,7 +52,7 @@ parity with the official OBSBOT Center (Windows/macOS only).
 - [ ] Status LED behavior
 - [ ] Audio: mic gain, noise reduction (if exposed by firmware)
 - [ ] Device info: model, firmware version, serial
-- [ ] Settings persistence & restore on reconnect
+- [x] Settings persistence & restore on reconnect
 - [ ] Firmware update (stretch goal — high risk, official tool may stay required)
 
 ### Linux-native extras (beyond OBSBOT Center)
@@ -64,10 +64,20 @@ parity with the official OBSBOT Center (Windows/macOS only).
 - [x] Virtual camera output for other apps (needs `v4l2loopback`)
 - [x] Effect profiles: save, update and switch whole filter set-ups
       (Ctrl+1 … Ctrl+9)
-- [ ] Camera profiles (gimbal, image settings) switchable via CLI/hotkey
-- [ ] System tray quick controls
+- [x] Named camera positions (gimbal, zoom, whiteboard straightening),
+      switchable from the GUI and `obsbotctl app position`
+- [x] Outside control: `obsbotctl app …` for desktop shortcuts
+- [x] Away card / freeze, name badge, logo, auto-correct, background library
+- [x] Automatic privacy: sleep on screen lock or when unwatched
+- [x] Multi-person effects (up to four faces)
+- [x] Hand gestures: applause, idea, fireworks
+- [x] Compact controls-only window; virtual camera status indicator
+- [x] Installer sets up the virtual camera for every boot and removes it on
+      uninstall
+- [x] System tray quick controls, background running, start at login
 - [ ] D-Bus API so other tools (Stream Deck, OBS scripts) can drive the camera
 - [x] Hot-plug handling (udev)
+- [x] User-level installer (`scripts/install.sh`)
 - [ ] Packaging: Flatpak, AUR, .deb
 
 ## Architecture

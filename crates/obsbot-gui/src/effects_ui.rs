@@ -1,17 +1,24 @@
 //! The Effects panel: virtual camera switch plus one tab per effect family.
 
+use crate::backgrounds::BackdropLibrary;
 use crate::effects::{
     Active, BeautyPreset, Choice, EffectSettings, EffectsController, Group, ANONYMISE,
-    ANONYMISE_STYLES, BACKGROUNDS, DISTORTIONS, EYE_COLORS, LIGHT_PRESETS, LIGHT_X, LIGHT_Y,
-    LIP_COLORS, LOOKS, PAINTS, RESOLUTIONS, RIM_COLORS, STICKERS, TRIGGERS,
+    ANONYMISE_STYLES, BACKGROUNDS, DISTORTIONS, EYE_COLORS, FIRST_GESTURE, IDEA, LIGHT_PRESETS,
+    LIGHT_X, LIGHT_Y, LIP_COLORS, LOOKS, MAGIC_COLORS, PAINTS, QUESTIONS, RESOLUTIONS, RIM_COLORS,
+    STICKERS, STORM, TRIGGERS,
 };
+use crate::effects::{
+    BadgeDesign, Broadcast, Session, BADGE_COLORS, BADGE_LAYOUTS, BADGE_STYLES, MAX_FACES,
+};
+use crate::fonts::FontList;
 use crate::luts::LutLibrary;
+use crate::picker::FilePicker;
 use crate::preview::Preview;
-use crate::profiles::{ProfileStore, MAX_NAME_CHARS, SHORTCUTS};
+use crate::profiles::{ProfileStore, MAX_NAME_CHARS, NEUTRAL, SHORTCUTS};
 use crate::theme::*;
 use crate::widgets::{
-    amount, caption, card, chip, color_dot, grid, hint, icon_tile, light_pad, link, pill,
-    segmented, status_pill, swatch_tile, tab_bar, toggle,
+    amount, caption, card, chip, color_dot, grid, hint, icon_tile, image_tile, light_pad, link,
+    pill, position_picker, segmented, status_pill, swatch_tile, switch_row, tab_bar, toggle,
 };
 use eframe::egui::{self, RichText, Sense, Ui, Vec2};
 use std::path::Path;
@@ -25,6 +32,7 @@ pub fn show(
     tab: &mut Group,
 ) {
     let before = effects.settings.clone();
+    let session_before = effects.session.clone();
     let mut power = effects.enabled;
     let mut restart = false;
 
@@ -47,6 +55,9 @@ pub fn show(
 
     let settings = &mut effects.settings;
     let luts = &mut effects.luts;
+    let session = &mut effects.session;
+    let backdrops = &mut effects.backdrops;
+    let fonts = &mut effects.fonts;
     let group = *tab;
     let mut reset = false;
     let resettable = settings.count(group) > 0;
@@ -67,7 +78,7 @@ pub fn show(
             Group::Funny => funny_tab(ui, settings),
             Group::Magic => magic_tab(ui, settings),
             Group::Paint => paint_tab(ui, settings),
-            Group::Backdrop => backdrop_tab(ui, settings),
+            Group::Backdrop => scene_tab(ui, settings, session, backdrops, fonts),
         },
     );
     if reset {
@@ -86,7 +97,7 @@ pub fn show(
         if let Some(input) = input {
             effects.restart(input, preview);
         }
-    } else if effects.settings != before {
+    } else if effects.settings != before || effects.session != session_before {
         effects.settings_changed(input, preview);
     }
 }
@@ -204,6 +215,8 @@ fn profiles_card(ui: &mut Ui, settings: &mut EffectSettings, store: &mut Profile
                     store.draft = None;
                     store.message = None;
                 }
+            } else if selected.as_deref() == Some(NEUTRAL) {
+                hint(ui, "Every effect is off. This profile is built in.");
             } else if let Some(name) = &selected {
                 // Showing a saved profile untouched: the only thing left to do is delete it.
                 let confirming = store.confirm_delete.as_deref() == Some(name.as_str());
@@ -285,13 +298,27 @@ fn camera_card(ui: &mut Ui, effects: &mut EffectsController, power: &mut bool, r
             }
         },
         |ui| {
+            let broadcast = effects.broadcast();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Virtual camera").size(12.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    status_pill(
+                        ui,
+                        &broadcast.label(),
+                        match broadcast {
+                            Broadcast::NotSetUp | Broadcast::Connecting => WARNING,
+                            Broadcast::Idle => TEXT_MUTED,
+                            Broadcast::Live { .. } => SUCCESS,
+                        },
+                    );
+                });
+            });
+            hint(ui, broadcast.explanation());
+            ui.add_space(4.0);
             hint(
                 ui,
-                if effects.enabled && effects.publishing {
-                    "Choose “OBSBOT Virtual Camera” in your video app."
-                } else if effects.enabled {
-                    "Showing in this preview only. To use it in other apps, run \
-                     scripts/setup-virtual-camera.sh and switch this on again."
+                if effects.enabled {
+                    "Your effects are showing in the preview."
                 } else if effects.settings.any_active() {
                     "Switch on to see your effects here and in other apps."
                 } else if effects.starts_automatically() {
@@ -375,7 +402,7 @@ fn looks_tab(ui: &mut Ui, settings: &mut EffectSettings, luts: &mut LutLibrary) 
 /// LUT tiles plus importing your own `.cube` files.
 fn lut_section(ui: &mut Ui, settings: &mut EffectSettings, luts: &mut LutLibrary) {
     luts.rescan_if_due();
-    if let Some(picked) = luts.take_picked() {
+    if let Some(picked) = luts.picker.take() {
         import_lut(settings, luts, &picked);
     }
     if !settings.lut.is_empty() && luts.find(&settings.lut).is_none() {
@@ -427,18 +454,16 @@ fn lut_section(ui: &mut Ui, settings: &mut EffectSettings, luts: &mut LutLibrary
     }
 
     ui.horizontal(|ui| {
-        if LutLibrary::can_browse() {
-            let label = if luts.browsing() {
-                "Choosing…"
-            } else {
-                "Add LUT…"
-            };
+        if FilePicker::available() {
+            let busy = luts.picker.busy();
+            let label = if busy { "Choosing…" } else { "Add LUT…" };
             if ui
-                .add_enabled(!luts.browsing(), egui::Button::new(label))
+                .add_enabled(!busy, egui::Button::new(label))
                 .on_hover_text("Import a .cube file")
                 .clicked()
             {
-                luts.browse();
+                luts.picker
+                    .open("Choose a .cube LUT", "LUT files", &["*.cube", "*.CUBE"]);
             }
         }
         if ui
@@ -505,7 +530,18 @@ fn import_lut(settings: &mut EffectSettings, luts: &mut LutLibrary, path: &Path)
 }
 
 fn lights_tab(ui: &mut Ui, settings: &mut EffectSettings) {
-    hint(ui, "Light yourself like a studio — no lamps required.");
+    amount(
+        ui,
+        "Auto-correct",
+        &mut settings.auto_enhance,
+        0.0..=1.0,
+        0.0,
+    );
+    hint(
+        ui,
+        "Fixes dim rooms and colour casts by itself. Start here, then add lights if you like.",
+    );
+    caption(ui, "Studio lights");
     let current = settings.light_preset();
     grid(ui, LIGHT_PRESETS.len(), 4, 68.0, |ui, index, size| {
         let preset = &LIGHT_PRESETS[index];
@@ -704,8 +740,15 @@ fn paint_tab(ui: &mut Ui, settings: &mut EffectSettings) {
 }
 
 fn magic_tab(ui: &mut Ui, settings: &mut EffectSettings) {
-    hint(ui, "Pull a face to set these off.");
+    hint(ui, "Pull a face or use your hands to set these off.");
+    let hands_ready = crate::paths::has_hand_model();
     for (index, trigger) in TRIGGERS.iter().enumerate() {
+        if index == FIRST_GESTURE && !hands_ready {
+            hint(
+                ui,
+                "The hand gestures need one more download: run scripts/install.sh again.",
+            );
+        }
         let row = egui::Frame::new()
             .fill(TILE)
             .corner_radius(10)
@@ -733,30 +776,290 @@ fn magic_tab(ui: &mut Ui, settings: &mut EffectSettings) {
         {
             settings.triggers[index] = !settings.triggers[index];
         }
+        let color = match index {
+            QUESTIONS => Some(("Question mark colour", &mut settings.question_color)),
+            IDEA => Some(("Star colour", &mut settings.star_color)),
+            _ => None,
+        };
+        if let (true, Some((label, choice))) = (settings.triggers[index], color) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(RichText::new(label).size(11.0).color(TEXT_MUTED));
+                for (position, tint) in MAGIC_COLORS.iter().enumerate() {
+                    if color_dot(ui, Some(tint.rgb), tint.label, *choice == position).clicked() {
+                        *choice = position;
+                    }
+                }
+            });
+        }
+        if index == STORM && settings.triggers[STORM] {
+            amount(
+                ui,
+                "Storm sensitivity",
+                &mut settings.storm_sensitivity,
+                0.0..=1.0,
+                0.5,
+            );
+            hint(
+                ui,
+                "Lower if it rains while you look neutral, higher if a frown is not enough.",
+            );
+        }
     }
 }
 
-fn backdrop_tab(ui: &mut Ui, settings: &mut EffectSettings) {
+/// Background, framing, and the things laid over the picture.
+fn scene_tab(
+    ui: &mut Ui,
+    settings: &mut EffectSettings,
+    session: &mut Session,
+    library: &mut BackdropLibrary,
+    fonts: &mut FontList,
+) {
+    caption(ui, "Background");
     let labels: Vec<String> = BACKGROUNDS.iter().map(|b| b.label.to_owned()).collect();
     segmented(ui, &labels, &mut settings.background);
-    hint(ui, BACKGROUNDS[settings.background].hint);
     match settings.background {
         1 => {
             amount(ui, "Blur", &mut settings.blur, 0.0..=1.0, 0.55);
         }
-        2 => {
-            caption(ui, "Picture file");
-            ui.add(
-                egui::TextEdit::singleline(&mut settings.background_path)
-                    .hint_text("/home/me/Pictures/background.jpg")
-                    .desired_width(f32::INFINITY),
+        2 => background_library(ui, settings, library),
+        _ => hint(ui, BACKGROUNDS[0].hint),
+    }
+
+    caption(ui, "Framing");
+    switch_row(
+        ui,
+        "Auto-frame — keep me centred",
+        &mut settings.autoframe_on,
+    );
+    if settings.autoframe_on {
+        amount(ui, "Tightness", &mut settings.autoframe, 0.0..=1.0, 0.5);
+    }
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("People to follow").size(12.0));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for count in (1..=MAX_FACES).rev() {
+                let chosen = settings.faces == count;
+                if ui
+                    .add(egui::Button::new(count.to_string()).selected(chosen))
+                    .on_hover_text(
+                        "Effects, auto-framing and the anonymiser follow this many faces",
+                    )
+                    .clicked()
+                {
+                    settings.faces = count;
+                }
+            }
+        });
+    });
+    switch_row(ui, "Mirror picture", &mut session.mirror);
+    switch_row(ui, "Flip upside down", &mut session.flip);
+
+    caption(ui, "Name badge");
+    switch_row(ui, "Show my name", &mut settings.badge);
+    ui.add(
+        egui::TextEdit::singleline(&mut session.badge_name)
+            .hint_text("Your name")
+            .char_limit(60)
+            .desired_width(f32::INFINITY),
+    );
+    ui.add(
+        egui::TextEdit::singleline(&mut session.badge_title)
+            .hint_text("Title or team (optional)")
+            .char_limit(80)
+            .desired_width(f32::INFINITY),
+    );
+    ui.collapsing(RichText::new("Badge design").color(TEXT_MUTED), |ui| {
+        badge_design(ui, &mut session.badge_design, fonts);
+    });
+
+    caption(ui, "Logo");
+    switch_row(ui, "Show logo in the corner", &mut settings.logo);
+    if let Some(picked) = library.logo_picker.take() {
+        session.logo_path = picked.to_string_lossy().into_owned();
+        settings.logo = true;
+    }
+    ui.horizontal(|ui| {
+        if FilePicker::available()
+            && ui
+                .add_enabled(!library.logo_picker.busy(), egui::Button::new("Choose…"))
+                .clicked()
+        {
+            library.logo_picker.open(
+                "Choose a logo",
+                "Pictures",
+                &["*.png", "*.PNG", "*.jpg", "*.jpeg", "*.JPG"],
             );
-            let path = settings.background_path.trim();
-            if !path.is_empty() && !Path::new(path).is_file() {
-                message(ui, "That file does not exist.", WARNING);
+        }
+        ui.add(
+            egui::TextEdit::singleline(&mut session.logo_path)
+                .hint_text("Path of a PNG or JPEG")
+                .desired_width(f32::INFINITY),
+        );
+    });
+    let logo = session.logo_path.trim();
+    if settings.logo && logo.is_empty() {
+        message(ui, "Choose a picture to use as the logo.", WARNING);
+    } else if !logo.is_empty() && !Path::new(logo).is_file() {
+        message(ui, "That file does not exist.", WARNING);
+    }
+}
+
+/// Layout, colour and font of the name badge.
+fn badge_design(ui: &mut Ui, design: &mut BadgeDesign, fonts: &mut FontList) {
+    caption(ui, "Style");
+    let styles: Vec<String> = BADGE_STYLES.iter().map(|c| c.label.to_owned()).collect();
+    segmented(ui, &styles, &mut design.style);
+    hint(ui, BADGE_STYLES[design.style].hint);
+    let layouts: Vec<String> = BADGE_LAYOUTS.iter().map(|c| c.label.to_owned()).collect();
+    segmented(ui, &layouts, &mut design.layout);
+
+    caption(ui, "Position");
+    ui.horizontal(|ui| {
+        position_picker(ui, &mut design.position);
+        hint(ui, "Click where the badge\nshould sit.");
+    });
+    amount(ui, "Size", &mut design.size, 0.0..=1.0, 0.35);
+    amount(ui, "Edge distance", &mut design.margin, 0.0..=1.0, 0.35);
+
+    caption(ui, "Colour");
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for (index, tint) in BADGE_COLORS.iter().enumerate() {
+            if color_dot(ui, Some(tint.rgb), tint.label, design.color == index).clicked() {
+                design.color = index;
             }
         }
-        _ => {}
+    });
+    if design.style != 4 {
+        amount(ui, "Panel opacity", &mut design.opacity, 0.0..=1.0, 0.8);
+    }
+
+    caption(ui, "Font");
+    fonts.refresh();
+    let shown = if design.font.is_empty() {
+        "System default".to_owned()
+    } else {
+        design.font.clone()
+    };
+    egui::ComboBox::from_id_salt("badge-font")
+        .width(ui.available_width() - 8.0)
+        .height(280.0)
+        .selected_text(shown)
+        .show_ui(ui, |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut fonts.filter)
+                    .hint_text("Search fonts…")
+                    .desired_width(f32::INFINITY),
+            );
+            if fonts.loading() {
+                hint(ui, "Listing fonts…");
+            }
+            if fonts.filter.trim().is_empty() {
+                ui.selectable_value(&mut design.font, String::new(), "System default");
+            }
+            let matches = fonts.matches();
+            if matches.is_empty() && !fonts.loading() {
+                hint(ui, "No font matches.");
+            }
+            // Long lists are trimmed; searching narrows them down.
+            for family in matches.into_iter().take(150) {
+                ui.selectable_value(&mut design.font, family.to_owned(), family);
+            }
+        });
+    switch_row(ui, "Bold name", &mut design.bold);
+    switch_row(ui, "Name in capitals", &mut design.caps);
+    if *design != BadgeDesign::default() && link(ui, "Reset design").clicked() {
+        *design = BadgeDesign::default();
+    }
+}
+
+/// Thumbnails of the bundled and added backgrounds.
+fn background_library(ui: &mut Ui, settings: &mut EffectSettings, library: &mut BackdropLibrary) {
+    library.rescan_if_due();
+    if let Some(picked) = library.picker.take() {
+        match library.import(&picked) {
+            Ok(added) => {
+                settings.background_path = added.to_string_lossy().into_owned();
+                library.message = Some(("Background added.".into(), false));
+            }
+            Err(error) => library.message = Some((error, true)),
+        }
+    }
+    let ctx = ui.ctx().clone();
+    // Decode at most one new thumbnail per frame.
+    let mut budget = true;
+    let mut choose: Option<String> = None;
+    grid(ui, library.items.len(), 3, 82.0, |ui, index, size| {
+        let (name, path) = {
+            let item = &library.items[index];
+            (item.name.clone(), item.path.to_string_lossy().into_owned())
+        };
+        let selected = settings.background_path == path;
+        let texture = library.texture(&ctx, index, &mut budget);
+        if image_tile(ui, size, texture, &name, selected).clicked() {
+            choose = Some(path);
+        }
+    });
+    if let Some(path) = choose {
+        settings.background_path = path;
+    }
+    if !budget {
+        ctx.request_repaint();
+    }
+    if library.find(&settings.background_path).is_none() {
+        if settings.background_path.trim().is_empty() {
+            hint(ui, "Pick a background above.");
+        } else if !Path::new(settings.background_path.trim()).is_file() {
+            message(ui, "The chosen picture no longer exists.", WARNING);
+        }
+    }
+
+    let removable = library
+        .find(&settings.background_path)
+        .filter(|item| item.user)
+        .map(|item| item.path.clone());
+    ui.horizontal(|ui| {
+        if FilePicker::available() {
+            let busy = library.picker.busy();
+            let label = if busy {
+                "Choosing…"
+            } else {
+                "Add picture…"
+            };
+            if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                library.picker.open(
+                    "Choose a background picture",
+                    "Pictures",
+                    &["*.jpg", "*.jpeg", "*.png", "*.JPG", "*.PNG"],
+                );
+            }
+        }
+        if ui
+            .button("Open folder")
+            .on_hover_text("Drop JPEG or PNG pictures here and they appear above")
+            .clicked()
+        {
+            let _ = std::fs::create_dir_all(library.user_dir());
+            let _ = std::process::Command::new("xdg-open")
+                .arg(library.user_dir())
+                .spawn();
+        }
+        if let Some(path) = &removable {
+            if link(ui, "Remove this picture").clicked() {
+                match library.remove(path) {
+                    Ok(()) => {
+                        settings.background_path.clear();
+                        library.message = Some(("Picture removed.".into(), false));
+                    }
+                    Err(error) => library.message = Some((error, true)),
+                }
+            }
+        }
+    });
+    if let Some((text, is_error)) = &library.message {
+        message(ui, text, if *is_error { WARNING } else { SUCCESS });
     }
 }
 
@@ -783,10 +1086,15 @@ mod tests {
         };
         busy.apply_beauty_preset(BeautyPreset::Glam);
         busy.apply_light_preset(6);
-        busy.lut = format!(
-            "{}/../../effects/luts/Moonlight.cube",
-            env!("CARGO_MANIFEST_DIR")
-        );
+        busy.auto_enhance = 0.5;
+        busy.autoframe_on = true;
+        busy.faces = 2;
+        busy.badge = true;
+        busy.logo = true;
+        busy.lut = crate::paths::bundled("luts")
+            .join("Moonlight.cube")
+            .to_string_lossy()
+            .into_owned();
         for settings in [EffectSettings::default(), busy] {
             for group in Group::ALL {
                 let mut effects = EffectsController::for_tests();
@@ -822,7 +1130,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut store = ProfileStore::load(dir.clone(), true);
         let mut settings = EffectSettings::default();
-        let mut draw = |settings: &mut EffectSettings, store: &mut ProfileStore| {
+        let draw = |settings: &mut EffectSettings, store: &mut ProfileStore| {
             for _ in 0..2 {
                 let _ = ctx.run(egui::RawInput::default(), |ctx| {
                     egui::CentralPanel::default()
@@ -841,8 +1149,31 @@ mod tests {
         settings.grain = 0.5;
         draw(&mut settings, &mut store);
         assert!(store.matching(&settings).is_none());
-        assert_eq!(store.profiles.len(), 4, "drawing must not save or delete");
+        assert_eq!(store.profiles.len(), 5, "drawing must not save or delete");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The badge design controls, which live in a section that starts closed.
+    #[test]
+    fn badge_design_controls_render_without_changing_the_design() {
+        let ctx = egui::Context::default();
+        let mut fonts = FontList::with_families(&["Liberation Sans", "Noto Serif"]);
+        for style in 0..BADGE_STYLES.len() {
+            let mut design = BadgeDesign {
+                style,
+                font: "Noto Serif".into(),
+                ..BadgeDesign::default()
+            };
+            let before = design.clone();
+            for _ in 0..2 {
+                let output = ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default()
+                        .show(ctx, |ui| badge_design(ui, &mut design, &mut fonts));
+                });
+                assert!(!output.shapes.is_empty());
+            }
+            assert_eq!(design, before);
+        }
     }
 
     /// Every icon must exist in the bundled fonts, or tiles would show blanks.

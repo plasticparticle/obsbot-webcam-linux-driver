@@ -1,9 +1,8 @@
 //! The LUT library: bundled `.cube` files plus the ones the user imported.
 
+use crate::picker::FilePicker;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Largest `.cube` file accepted for import (a 129-point LUT is about 60 MB).
@@ -121,7 +120,7 @@ pub struct LutLibrary {
     pub luts: Vec<Lut>,
     bundled_dir: PathBuf,
     user_dir: PathBuf,
-    picker: Option<Receiver<Option<PathBuf>>>,
+    pub picker: FilePicker,
     last_scan: Instant,
     /// Text in the "paste a path" box.
     pub import_path: String,
@@ -135,7 +134,7 @@ impl LutLibrary {
             luts: Vec::new(),
             bundled_dir,
             user_dir,
-            picker: None,
+            picker: FilePicker::default(),
             last_scan: Instant::now(),
             import_path: String::new(),
             message: None,
@@ -221,71 +220,6 @@ impl LutLibrary {
         fs::remove_file(path).map_err(|error| format!("Cannot remove the LUT: {error}"))?;
         self.rescan();
         Ok(())
-    }
-
-    pub fn can_browse() -> bool {
-        picker_command().is_some()
-    }
-
-    /// Open the desktop's file chooser without blocking the UI.
-    pub fn browse(&mut self) {
-        let Some((program, args)) = picker_command() else {
-            return;
-        };
-        let (tx, rx) = mpsc::channel();
-        self.picker = Some(rx);
-        std::thread::spawn(move || {
-            let output = Command::new(program)
-                .args(args)
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .output();
-            let picked = output.ok().and_then(|output| {
-                let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                (output.status.success() && !text.is_empty()).then(|| PathBuf::from(text))
-            });
-            let _ = tx.send(picked);
-        });
-    }
-
-    pub fn browsing(&self) -> bool {
-        self.picker.is_some()
-    }
-
-    /// The file chosen in the dialog opened by `browse`, once there is one.
-    pub fn take_picked(&mut self) -> Option<PathBuf> {
-        let result = match self.picker.as_ref()?.try_recv() {
-            Ok(picked) => picked,
-            Err(TryRecvError::Empty) => return None,
-            Err(TryRecvError::Disconnected) => None,
-        };
-        self.picker = None;
-        result
-    }
-}
-
-fn on_path(program: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
-}
-
-fn picker_command() -> Option<(&'static str, Vec<&'static str>)> {
-    if on_path("zenity") {
-        Some((
-            "zenity",
-            vec![
-                "--file-selection",
-                "--title=Choose a .cube LUT",
-                "--file-filter=LUT files (*.cube) | *.cube *.CUBE",
-            ],
-        ))
-    } else if on_path("kdialog") {
-        Some((
-            "kdialog",
-            vec!["--getopenfilename", ".", "LUT files (*.cube)"],
-        ))
-    } else {
-        None
     }
 }
 

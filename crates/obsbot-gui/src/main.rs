@@ -3,19 +3,45 @@
 //! Pure-native egui window: live preview + full camera control. No webview,
 //! no local server — everything talks straight to /dev/video*.
 
+mod app_panel;
+mod app_settings;
+mod automation;
+mod backgrounds;
+mod camera_store;
+mod commands;
+mod conf;
 mod effects;
 mod effects_ui;
+mod fonts;
+mod ipc;
 mod luts;
+mod paths;
+mod picker;
+mod positions;
+mod positions_ui;
 mod preview;
 mod profiles;
 mod theme;
+mod tray;
 mod widgets;
 
-use effects::{EffectsController, Group};
+use app_settings::AppSettings;
+use automation::{Action, AutoSleep, Monitor};
+use camera_store::CameraSettings;
+use commands::Command;
+use effects::{EffectsController, Group, Hold};
 use eframe::egui::{self, Color32, RichText, Stroke};
 use obsbot_core::{ctrl, AiMode, Device, Fov, TrackingSpeed};
+use positions::{Position, Positions};
 use preview::Preview;
+use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use theme::*;
+use tray::TrayIcon;
+
+const FOVS: [Fov; 3] = [Fov::Wide, Fov::Normal, Fov::Narrow];
 
 fn configure_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
@@ -70,18 +96,85 @@ fn metric(ui: &mut egui::Ui, label: &str, value: String) {
 }
 
 fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 720.0])
-            .with_min_inner_size([900.0, 560.0])
-            .with_title("OBSBOT Control Center"),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "OBSBOT Control Center",
-        options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    )
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!(
+            "OBSBOT Control Center\n\n  --background  start in the tray without opening the window\n  \
+             --paths       show where the effects runtime was found\n\n\
+             Control a running instance with: obsbotctl app help"
+        );
+        return Ok(());
+    }
+    if arguments.iter().any(|arg| arg == "--paths") {
+        println!("{}", paths::report());
+        return Ok(());
+    }
+    let background = arguments.iter().any(|arg| arg == "--background");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let status = Arc::new(Mutex::new(ipc::Shared::default()));
+    match ipc::serve(sender.clone(), status.clone()) {
+        Ok(true) => {}
+        Ok(false) => {
+            // Already running: bring that window up instead of starting twice.
+            if !background {
+                let _ = obsbot_core::app_ipc::send("show");
+            }
+            return Ok(());
+        }
+        Err(error) => eprintln!("commands from outside are unavailable: {error}"),
+    }
+    let tray = TrayIcon::start(sender);
+    let core = Arc::new(Mutex::new(Core::new(receiver, status, tray, !background)));
+
+    let mut show_window = !background;
+    loop {
+        if show_window {
+            let (size, min_size) = window_sizes(lock(&core).app.compact);
+            let options = eframe::NativeOptions {
+                viewport: egui::ViewportBuilder::default()
+                    .with_inner_size(size)
+                    .with_min_inner_size(min_size)
+                    .with_title("OBSBOT Control Center"),
+                ..Default::default()
+            };
+            let shared = core.clone();
+            eframe::run_native(
+                "OBSBOT Control Center",
+                options,
+                Box::new(move |cc| Ok(Box::new(App::new(cc, shared)))),
+            )?;
+            let mut core = lock(&core);
+            let hidden = std::mem::take(&mut core.hide_requested);
+            if core.quit || !(hidden || core.app.keep_running) {
+                break;
+            }
+        }
+        // Window closed (or never opened): keep serving the tray and commands.
+        show_window = loop {
+            {
+                let mut core = lock(&core);
+                core.tick();
+                if core.quit {
+                    break false;
+                }
+                if std::mem::take(&mut core.show_requested) {
+                    break true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        if !show_window {
+            break;
+        }
+    }
+    lock(&core).shutdown();
+    ipc::close();
+    Ok(())
+}
+
+fn lock(core: &Mutex<Core>) -> std::sync::MutexGuard<'_, Core> {
+    // A panic elsewhere must not take the camera controls down with it.
+    core.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// UI-side mirror of the camera state; refreshed periodically.
@@ -109,37 +202,498 @@ struct CamState {
     presets: [bool; 3],
 }
 
-struct App {
+impl CamState {
+    /// The part of the state that is saved and restored.
+    fn saved(&self) -> CameraSettings {
+        CameraSettings {
+            zoom: self.zoom,
+            brightness: self.brightness,
+            contrast: self.contrast,
+            saturation: self.saturation,
+            sharpness: self.sharpness,
+            wb_auto: self.wb_auto,
+            wb_temp: self.wb_temp,
+            exp_auto: self.exp_auto,
+            exp_time: self.exp_time,
+            focus_auto: self.focus_auto,
+            anti_flicker: self.anti_flicker,
+            hdr: self.hdr,
+            face_ae: self.face_ae,
+            fov: self.fov,
+            ai_mode: self.ai_mode.map(|mode| mode.label().to_owned()),
+            sport_speed: self.sport_speed,
+        }
+    }
+}
+
+/// Everything that keeps working while the window is closed.
+struct Core {
     dev: Option<Device>,
     state: CamState,
     preview: Preview,
     effects: EffectsController,
-    /// 0 = camera controls, 1 = effects.
+    app: AppSettings,
+    positions: Positions,
+    /// 0 = camera controls, 1 = effects, 2 = app settings.
     panel: usize,
     effects_tab: Group,
-    last_poll: f64,
+    last_poll: Instant,
+    last_tick: Instant,
     error: Option<String>,
+    camera_file: PathBuf,
+    /// What is in `camera_file`, once the camera state is known to be real.
+    camera_saved: Option<CameraSettings>,
+    camera_changed: Option<Instant>,
+    monitor: Monitor,
+    auto_sleep: AutoSleep,
+    watching_virtual_camera: bool,
+    commands: Receiver<Command>,
+    tray: Option<TrayIcon>,
+    status: Arc<Mutex<ipc::Shared>>,
+    window_open: bool,
+    quit: bool,
+    show_requested: bool,
+    /// Set when the layout changed and the window should take its new size.
+    resize_requested: bool,
+    /// Close the window but stay alive, whatever the setting says.
+    hide_requested: bool,
+    /// The last sleep/wake this app sent, and when.
+    sleep_commanded: Option<(bool, Instant)>,
 }
 
-impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_zoom_factor(1.1);
-        configure_style(&cc.egui_ctx);
-        let mut app = App {
+impl Core {
+    fn new(
+        commands: Receiver<Command>,
+        status: Arc<Mutex<ipc::Shared>>,
+        tray: Option<TrayIcon>,
+        window_open: bool,
+    ) -> Self {
+        let mut core = Core {
             dev: Device::discover().ok(),
             state: CamState::default(),
             preview: Preview::start(),
             effects: EffectsController::load(),
+            app: AppSettings::load(),
+            positions: Positions::load(conf::config_dir().join("positions.conf")),
             panel: 0,
             effects_tab: Group::Looks,
-            last_poll: -10.0,
+            last_poll: Instant::now(),
+            last_tick: Instant::now(),
             error: None,
+            camera_file: conf::config_dir().join("camera.conf"),
+            camera_saved: None,
+            camera_changed: None,
+            monitor: Monitor::start(),
+            auto_sleep: AutoSleep::default(),
+            watching_virtual_camera: false,
+            commands,
+            tray,
+            status,
+            window_open: true,
+            quit: false,
+            show_requested: false,
+            resize_requested: false,
+            hide_requested: false,
+            sleep_commanded: None,
         };
         // Defaults for XU-side toggles that have no readback.
-        app.state.face_ae = true;
-        app.state.fov = 0;
-        app.refresh(true);
-        app
+        core.state.face_ae = true;
+        core.state.fov = 0;
+        if core.dev.is_some() {
+            core.connected();
+        }
+        core.set_window_open(window_open);
+
+        // Start-up profile, then effects if asked for.
+        let input = core.input();
+        if !core.app.startup_profile.is_empty() {
+            let name = core.app.startup_profile.clone();
+            if let Some(profile) = core.effects.profiles.find(&name).cloned() {
+                core.effects.settings = profile.settings;
+                core.effects.profiles.current = Some(profile.name);
+                let _ = core.effects.save();
+            }
+        }
+        if core.app.start_effects && core.effects.wants_worker() {
+            if let Some(input) = &input {
+                let _ = core.effects.start(input, &mut core.preview);
+            }
+        }
+        core
+    }
+
+    fn input(&self) -> Option<PathBuf> {
+        self.dev.as_ref().map(|device| device.path().to_path_buf())
+    }
+
+    /// The camera has just been found: read it, then put saved settings back.
+    fn connected(&mut self) {
+        self.refresh(true);
+        let saved = std::fs::read_to_string(&self.camera_file)
+            .ok()
+            .and_then(|text| CameraSettings::from_text(&text));
+        if let (true, Some(saved)) = (self.app.restore_camera, saved) {
+            self.restore_camera(&saved);
+        }
+        self.camera_saved = Some(self.state.saved());
+        self.camera_changed = None;
+    }
+
+    /// Apply every saved setting that differs from what the camera reports.
+    fn restore_camera(&mut self, saved: &CameraSettings) {
+        let now = self.state.saved();
+        let mode = saved
+            .ai_mode
+            .as_deref()
+            .and_then(|label| AiMode::ALL.into_iter().find(|mode| mode.label() == label));
+        self.with_dev(|d| {
+            for (id, was, want) in [
+                (ctrl::BRIGHTNESS, now.brightness, saved.brightness),
+                (ctrl::CONTRAST, now.contrast, saved.contrast),
+                (ctrl::SATURATION, now.saturation, saved.saturation),
+                (ctrl::SHARPNESS, now.sharpness, saved.sharpness),
+                (
+                    ctrl::POWER_LINE_FREQUENCY,
+                    now.anti_flicker,
+                    saved.anti_flicker,
+                ),
+            ] {
+                if was != want {
+                    d.set(id, want)?;
+                }
+            }
+            if now.wb_auto != saved.wb_auto {
+                d.set(ctrl::WHITE_BALANCE_AUTO, saved.wb_auto as i32)?;
+            }
+            if !saved.wb_auto && (now.wb_auto || now.wb_temp != saved.wb_temp) {
+                d.set(ctrl::WHITE_BALANCE_TEMPERATURE, saved.wb_temp)?;
+            }
+            if now.exp_auto != saved.exp_auto {
+                d.set(ctrl::AUTO_EXPOSURE, if saved.exp_auto { 0 } else { 1 })?;
+            }
+            if !saved.exp_auto && (now.exp_auto || now.exp_time != saved.exp_time) {
+                d.set(ctrl::EXPOSURE_TIME_ABSOLUTE, saved.exp_time)?;
+            }
+            if now.focus_auto != saved.focus_auto {
+                d.set(ctrl::FOCUS_AUTO, saved.focus_auto as i32)?;
+            }
+            if now.zoom != saved.zoom {
+                d.set_zoom(saved.zoom)?;
+            }
+            if now.hdr != saved.hdr {
+                d.set_hdr(saved.hdr)?;
+            }
+            // Neither of these can be read back, so always send them.
+            d.set_face_ae(saved.face_ae)?;
+            d.set_fov(FOVS[saved.fov.min(FOVS.len() - 1)])?;
+            if let Some(mode) = mode {
+                if now.ai_mode.as_deref() != saved.ai_mode.as_deref() {
+                    d.set_ai_mode(mode)?;
+                }
+            }
+            if now.sport_speed != saved.sport_speed {
+                d.set_tracking_speed(if saved.sport_speed {
+                    TrackingSpeed::Sport
+                } else {
+                    TrackingSpeed::Standard
+                })?;
+            }
+            Ok(())
+        });
+        let state = &mut self.state;
+        state.zoom = saved.zoom;
+        state.brightness = saved.brightness;
+        state.contrast = saved.contrast;
+        state.saturation = saved.saturation;
+        state.sharpness = saved.sharpness;
+        state.wb_auto = saved.wb_auto;
+        state.wb_temp = saved.wb_temp;
+        state.exp_auto = saved.exp_auto;
+        state.exp_time = saved.exp_time;
+        state.focus_auto = saved.focus_auto;
+        state.anti_flicker = saved.anti_flicker;
+        state.hdr = saved.hdr;
+        state.face_ae = saved.face_ae;
+        state.fov = saved.fov;
+        if let Some(mode) = mode {
+            state.ai_mode = Some(mode);
+        }
+        state.sport_speed = saved.sport_speed;
+    }
+
+    /// Write changed camera settings to disk once they have settled.
+    fn autosave_camera(&mut self) {
+        if self.dev.is_none() || self.camera_saved.is_none() {
+            return;
+        }
+        let current = self.state.saved();
+        if self.camera_saved.as_ref() == Some(&current) {
+            self.camera_changed = None;
+            return;
+        }
+        let since = *self.camera_changed.get_or_insert_with(Instant::now);
+        if since.elapsed() >= Duration::from_millis(1200) {
+            if conf::write_atomically(&self.camera_file, &current.to_text()).is_ok() {
+                self.camera_saved = Some(current);
+            }
+            self.camera_changed = None;
+        }
+    }
+
+    /// Whether the live preview is on screen: the window is open and not in
+    /// its compact, controls-only layout.
+    fn preview_visible(&self) -> bool {
+        self.window_open && !self.app.compact
+    }
+
+    /// Tell the effects worker and the camera preview whether anyone is
+    /// looking, so they stop producing pictures nobody sees.
+    fn sync_preview(&mut self) {
+        let input = self.input();
+        let visible = self.preview_visible();
+        self.effects
+            .set_window_open(visible, input.as_deref(), &mut self.preview);
+    }
+
+    fn set_compact(&mut self, compact: bool) {
+        if self.app.compact == compact {
+            return;
+        }
+        self.app.compact = compact;
+        if let Err(error) = self.app.save() {
+            self.error = Some(format!("Could not save app settings: {error}"));
+        }
+        self.sync_preview();
+        self.resize_requested = true;
+    }
+
+    fn set_window_open(&mut self, open: bool) {
+        self.window_open = open;
+        self.sync_preview();
+        if !open {
+            // Textures belong to the window that is going away.
+            self.preview.forget_texture();
+            self.effects.backdrops.forget_textures();
+            self.positions.adjusting = None;
+            self.effects.session.adjusting = false;
+        }
+    }
+
+    /// One step of everything that runs with or without a window.
+    fn tick(&mut self) {
+        let dt = self.last_tick.elapsed().as_secs_f32().min(5.0);
+        self.last_tick = Instant::now();
+        self.effects.poll(&mut self.preview);
+        if self.effects.watch_virtual_camera() {
+            if let Some(input) = self.input() {
+                self.effects.restart(&input, &mut self.preview);
+            }
+        }
+
+        // Reconnect / periodic status poll.
+        if self.dev.is_none() && self.last_poll.elapsed() > Duration::from_secs(2) {
+            self.dev = Device::discover().ok();
+            self.last_poll = Instant::now();
+            if self.dev.is_some() {
+                self.connected();
+            }
+        } else if self.last_poll.elapsed() > Duration::from_millis(1500) {
+            self.refresh(false);
+            self.last_poll = Instant::now();
+        }
+        self.autosave_camera();
+
+        while let Ok(command) = self.commands.try_recv() {
+            self.handle(command);
+        }
+
+        // Automatic privacy.
+        if self.effects.publishing != self.watching_virtual_camera {
+            self.watching_virtual_camera = self.effects.publishing;
+            self.monitor.watch(if self.effects.publishing {
+                effects::find_virtual_camera()
+            } else {
+                None
+            });
+        }
+        let session = self.monitor.session();
+        self.effects.viewers = if self.effects.publishing {
+            session.viewers
+        } else {
+            0
+        };
+        let in_use = self.window_open || session.viewers > 0;
+        if self.dev.is_some() {
+            let action = self.auto_sleep.step(
+                dt,
+                self.app.sleep_on_lock,
+                self.app.sleep_when_unused,
+                session.locked,
+                in_use,
+                self.state.sleeping,
+            );
+            if action != Action::None {
+                let sleep = action == Action::Sleep;
+                self.set_sleep(sleep);
+            }
+        }
+
+        self.report();
+    }
+
+    /// Refresh the tray and the `status` reply.
+    fn report(&mut self) {
+        let profile = self
+            .effects
+            .profiles
+            .matching(&self.effects.settings)
+            .map(|profile| profile.name.clone());
+        let snapshot = tray::Snapshot {
+            connected: self.dev.is_some(),
+            profiles: self
+                .effects
+                .profiles
+                .profiles
+                .iter()
+                .map(|profile| profile.name.clone())
+                .collect(),
+            current: profile.clone(),
+            effects_on: self.effects.enabled,
+            hold: self.effects.session.hold,
+            sleeping: self.state.sleeping,
+        };
+        let text = format!(
+            "camera={} effects={} output={} profile={} hold={} privacy={} window={}",
+            if snapshot.connected {
+                "connected"
+            } else {
+                "missing"
+            },
+            if snapshot.effects_on { "on" } else { "off" },
+            if self.effects.publishing {
+                "virtual-camera"
+            } else {
+                "preview"
+            },
+            profile.as_deref().unwrap_or("custom").replace(' ', "_"),
+            match snapshot.hold {
+                Hold::Off => "off",
+                Hold::Freeze => "freeze",
+                Hold::Card => "brb",
+            },
+            if snapshot.sleeping { "on" } else { "off" },
+            if self.window_open { "open" } else { "closed" },
+        );
+        if let Ok(mut shared) = self.status.lock() {
+            shared.status = text;
+            shared.profiles.clone_from(&snapshot.profiles);
+            shared.positions = self
+                .positions
+                .list
+                .iter()
+                .map(|position| position.name.clone())
+                .collect();
+        }
+        if let Some(tray) = &mut self.tray {
+            tray.show(snapshot);
+        }
+    }
+
+    /// Carry out a command from the tray or the command line.
+    fn handle(&mut self, command: Command) {
+        let input = self.input();
+        let input = input.as_deref();
+        match command {
+            Command::Show => self.show_requested = true,
+            Command::Hide => self.hide_requested = self.window_open,
+            Command::Quit => self.quit = true,
+            Command::Profile(name) => {
+                if !self
+                    .effects
+                    .apply_profile_named(&name, input, &mut self.preview)
+                {
+                    self.error = Some(format!("There is no profile called “{name}”."));
+                }
+            }
+            Command::ProfileStep(step) => self.effects.step_profile(step, input, &mut self.preview),
+            Command::Effects(switch) => {
+                if switch.apply(self.effects.enabled) {
+                    if let Some(input) = input {
+                        let _ = self.effects.start(input, &mut self.preview);
+                    }
+                } else {
+                    self.effects.stop_by_user(&mut self.preview);
+                }
+            }
+            Command::Hold(kind, switch, text) => {
+                if let Some(text) = text {
+                    self.effects.session.hold_text = text;
+                }
+                let on = switch.apply(self.effects.session.hold == kind);
+                let hold = if on { kind } else { Hold::Off };
+                self.effects.set_hold(hold, input, &mut self.preview);
+            }
+            Command::Privacy(switch) => {
+                let sleep = switch.apply(self.state.sleeping);
+                self.set_sleep(sleep);
+            }
+            Command::Position(name) => {
+                let wanted = name.trim().to_lowercase();
+                let found = self
+                    .positions
+                    .list
+                    .iter()
+                    .find(|position| position.name.to_lowercase() == wanted)
+                    .cloned();
+                match found {
+                    Some(position) => self.goto(&position),
+                    None => self.error = Some(format!("There is no position called “{name}”.")),
+                }
+            }
+        }
+    }
+
+    /// Put the camera to sleep ("privacy mode") or wake it.
+    fn set_sleep(&mut self, sleep: bool) {
+        self.with_dev(|d| d.set_sleep(sleep));
+        self.state.sleeping = sleep;
+        self.sleep_commanded = Some((sleep, Instant::now()));
+    }
+
+    /// Send the camera to a saved position.
+    fn goto(&mut self, position: &Position) {
+        let (pan, tilt, zoom) = (position.pan, position.tilt, position.zoom);
+        let fixed = position.corners.is_some();
+        self.with_dev(|d| {
+            if fixed {
+                // A straightened whiteboard only works if the camera holds still.
+                d.set_ai_mode(AiMode::NoTracking)?;
+            }
+            d.set_pan_deg(pan)?;
+            d.set_tilt_deg(tilt)?;
+            d.set_zoom(zoom)
+        });
+        self.state.pan = pan;
+        self.state.tilt = tilt;
+        self.state.zoom = zoom;
+        if fixed {
+            self.state.ai_mode = Some(AiMode::NoTracking);
+        }
+        self.positions.current = Some(position.name.clone());
+        self.positions.adjusting = None;
+        self.positions.confirm_delete = None;
+        self.effects.session.adjusting = false;
+        self.effects.session.keystone = position.corners;
+        let input = self.input();
+        self.effects
+            .settings_changed(input.as_deref(), &mut self.preview);
+    }
+
+    /// Stop the worker and release the camera before the process exits.
+    fn shutdown(&mut self) {
+        self.effects.stop(&mut self.preview);
+        self.preview.pause();
+        self.tray = None;
     }
 
     /// Pull current values from the camera into the UI state.
@@ -171,7 +725,12 @@ impl App {
                 }
             }
             let xs = dev.status()?;
-            self.state.sleeping = xs.sleeping;
+            // The camera takes a few seconds to report a sleep or wake it was
+            // just told to do; trust the command until then.
+            self.state.sleeping = match self.sleep_commanded {
+                Some((wanted, at)) if at.elapsed() < Duration::from_secs(6) => wanted,
+                _ => xs.sleeping,
+            };
             self.state.hdr = xs.hdr;
             self.state.ai_mode = xs.ai_mode;
             self.state.sport_speed = xs.tracking_speed == TrackingSpeed::Sport;
@@ -191,9 +750,47 @@ impl App {
     }
 }
 
+/// The window. It can be closed and reopened; `Core` lives on.
+struct App {
+    core: Arc<Mutex<Core>>,
+}
+
+impl App {
+    fn new(cc: &eframe::CreationContext<'_>, core: Arc<Mutex<Core>>) -> Self {
+        cc.egui_ctx.set_zoom_factor(1.1);
+        configure_style(&cc.egui_ctx);
+        lock(&core).set_window_open(true);
+        Self { core }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        lock(&self.core).set_window_open(false);
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.effects.poll(&mut self.preview);
+        let mut core = lock(&self.core);
+        core.tick();
+        if core.quit || core.hide_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if std::mem::take(&mut core.show_requested) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if std::mem::take(&mut core.resize_requested) {
+            let (size, min_size) = window_sizes(core.app.compact);
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(min_size.into()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size.into()));
+        }
+        core.ui(ctx);
+    }
+}
+
+impl Core {
+    fn ui(&mut self, ctx: &egui::Context) {
         // Ctrl+1 … Ctrl+9 switch effect profiles from anywhere in the window.
         const DIGITS: [egui::Key; profiles::SHORTCUTS] = [
             egui::Key::Num1,
@@ -211,22 +808,23 @@ impl eframe::App for App {
                 .iter()
                 .position(|key| input.consume_key(egui::Modifiers::COMMAND, *key))
         });
-        if let (Some(index), Some(device)) = (picked, &self.dev) {
-            let input = device.path().to_path_buf();
+        if let (Some(index), Some(input)) = (picked, self.input()) {
             self.effects
                 .apply_profile(index, Some(&input), &mut self.preview);
         }
-        // Reconnect / periodic status poll.
-        let now = ctx.input(|i| i.time);
-        if self.dev.is_none() && now - self.last_poll > 2.0 {
-            self.dev = Device::discover().ok();
-            self.last_poll = now;
-            if self.dev.is_some() {
-                self.refresh(true);
-            }
-        } else if now - self.last_poll > 1.5 {
-            self.refresh(false);
-            self.last_poll = now;
+
+        if self.app.compact {
+            // Controls only: no second view of your own face during a call.
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(PANEL))
+                .show(ctx, |ui| {
+                    let spare = (ui.available_width() - COMPACT_WIDTH).max(0.0) / 2.0;
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin::symmetric((16.0 + spare) as i8, 14))
+                        .show(ui, |ui| self.side_ui(ui));
+                });
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            return;
         }
 
         egui::SidePanel::right("controls")
@@ -236,30 +834,7 @@ impl eframe::App for App {
                     .fill(PANEL)
                     .inner_margin(egui::Margin::symmetric(16, 14)),
             )
-            .show(ctx, |ui| {
-                self.header_ui(ui);
-                if self.dev.is_none() {
-                    return;
-                }
-                egui::ScrollArea::vertical()
-                    .id_salt(self.panel)
-                    .auto_shrink([false; 2])
-                    .show(ui, |ui| {
-                        if self.panel == 0 {
-                            self.controls_ui(ui);
-                        } else {
-                            let input = self.dev.as_ref().map(|device| device.path().to_path_buf());
-                            effects_ui::show(
-                                ui,
-                                &mut self.effects,
-                                &mut self.preview,
-                                input.as_deref(),
-                                &mut self.effects_tab,
-                            );
-                        }
-                        ui.add_space(8.0);
-                    });
-            });
+            .show(ctx, |ui| self.side_ui(ui));
 
         egui::CentralPanel::default()
             .frame(
@@ -292,11 +867,7 @@ impl eframe::App for App {
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.dev.is_some() {
-                            widgets::status_pill(ui, "LIVE", SUCCESS);
-                        } else {
-                            widgets::status_pill(ui, "NO CAMERA", DANGER);
-                        }
+                        self.hold_ui(ui);
                     });
                 });
                 ui.add_space(10.0);
@@ -313,7 +884,14 @@ impl eframe::App for App {
                     .stroke(Stroke::new(1.0_f32, CARD_BORDER))
                     .corner_radius(14)
                     .inner_margin(egui::Margin::same(5))
-                    .show(ui, |ui| self.preview.show(ui));
+                    .show(ui, |ui| {
+                        let picture = self.preview.show(ui);
+                        if let (Some(rect), Some(corners)) =
+                            (picture, &mut self.positions.adjusting)
+                        {
+                            widgets::corner_handles(ui, rect, corners);
+                        }
+                    });
             });
 
         // Live preview needs continuous repaints.
@@ -321,8 +899,93 @@ impl eframe::App for App {
     }
 }
 
-impl App {
-    /// Branding, connection status and the Camera / Effects switch.
+/// Width of the controls column in the compact layout.
+const COMPACT_WIDTH: f32 = 380.0;
+
+/// Window size and minimum size for the full and the compact layout.
+fn window_sizes(compact: bool) -> ([f32; 2], [f32; 2]) {
+    if compact {
+        ([COMPACT_WIDTH + 32.0, 720.0], [COMPACT_WIDTH + 32.0, 420.0])
+    } else {
+        ([1180.0, 720.0], [900.0, 560.0])
+    }
+}
+
+impl Core {
+    /// Everything in the controls column: header, panel switch and the panel.
+    fn side_ui(&mut self, ui: &mut egui::Ui) {
+        self.header_ui(ui);
+        if self.dev.is_none() {
+            return;
+        }
+        if self.app.compact {
+            // The preview's status and step-away buttons, which would
+            // otherwise be out of reach in this layout.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.hold_ui(ui);
+            });
+            ui.add_space(8.0);
+        }
+        egui::ScrollArea::vertical()
+            .id_salt(self.panel)
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                if self.panel == 0 {
+                    self.controls_ui(ui);
+                } else if self.panel == 1 {
+                    let input = self.input();
+                    effects_ui::show(
+                        ui,
+                        &mut self.effects,
+                        &mut self.preview,
+                        input.as_deref(),
+                        &mut self.effects_tab,
+                    );
+                } else {
+                    let has_tray = self.tray.is_some();
+                    app_panel::show(ui, &mut self.app, &mut self.effects, has_tray);
+                }
+                ui.add_space(8.0);
+            });
+    }
+
+    /// On-air status and the step-away buttons, laid out right to left.
+    fn hold_ui(&mut self, ui: &mut egui::Ui) {
+        let hold = self.effects.session.hold;
+        match (self.dev.is_some(), hold) {
+            (false, _) => widgets::status_pill(ui, "NO CAMERA", DANGER),
+            (true, Hold::Card) => widgets::status_pill(ui, "AWAY", WARNING),
+            (true, Hold::Freeze) => widgets::status_pill(ui, "FROZEN", WARNING),
+            (true, Hold::Off) => widgets::status_pill(ui, "LIVE", SUCCESS),
+        }
+        if self.dev.is_some() {
+            // One click to step away from a call.
+            let mut wanted = hold;
+            for (label, kind, tip) in [
+                ("Freeze", Hold::Freeze, "Hold the last picture still"),
+                (
+                    "Be right back",
+                    Hold::Card,
+                    "Show your away message instead of the camera",
+                ),
+            ] {
+                if ui
+                    .add(egui::Button::new(label).selected(hold == kind))
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    wanted = if hold == kind { Hold::Off } else { kind };
+                }
+            }
+            if wanted != hold {
+                let input = self.input();
+                self.effects
+                    .set_hold(wanted, input.as_deref(), &mut self.preview);
+            }
+        }
+    }
+
+    /// Branding, connection status and the panel switch.
     fn header_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             egui::Frame::new()
@@ -339,6 +1002,20 @@ impl App {
                         .size(10.0)
                         .color(TEXT_MUTED),
                 );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let compact = self.app.compact;
+                let (label, tip) = if compact {
+                    ("Show preview", "Bring back the live preview")
+                } else {
+                    (
+                        "Hide preview",
+                        "Controls only — less distracting during a call",
+                    )
+                };
+                if ui.button(label).on_hover_text(tip).clicked() {
+                    self.set_compact(!compact);
+                }
             });
         });
         ui.add_space(12.0);
@@ -408,6 +1085,7 @@ impl App {
             } else {
                 format!("✨  Effects  ·  {count}")
             },
+            "⚙  App".to_owned(),
         ];
         widgets::segmented(ui, &labels, &mut self.panel);
         ui.add_space(10.0);
@@ -441,8 +1119,7 @@ impl App {
             )
             .clicked()
         {
-            self.with_dev(|d| d.set_sleep(!sleeping));
-            self.state.sleeping = !sleeping;
+            self.set_sleep(!sleeping);
         }
         ui.add_space(10.0);
 
@@ -515,9 +1192,25 @@ impl App {
         });
         ui.add_space(10.0);
 
-        section(ui, "⭐", "Presets", |ui| {
+        let before = self.effects.session.clone();
+        let view = positions_ui::View {
+            pan: self.state.pan,
+            tilt: self.state.tilt,
+            zoom: self.state.zoom,
+        };
+        let goto = positions_ui::show(ui, &mut self.positions, &mut self.effects.session, view);
+        if let Some(position) = goto {
+            self.goto(&position);
+        } else if self.effects.session != before {
+            let input = self.input();
+            self.effects
+                .settings_changed(input.as_deref(), &mut self.preview);
+        }
+        ui.add_space(10.0);
+
+        section(ui, "⭐", "Camera memory", |ui| {
             ui.label(
-                RichText::new("Recall a saved camera position")
+                RichText::new("Three positions stored in the camera itself")
                     .size(10.0)
                     .color(TEXT_MUTED),
             );
@@ -716,19 +1409,14 @@ impl App {
     }
 }
 
-impl Drop for App {
-    fn drop(&mut self) {
-        self.effects.stop(&mut self.preview);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     /// Icons used in this file must exist in the bundled fonts.
     #[test]
     fn camera_panel_icons_have_glyphs() {
         let icons = [
-            "📷", "✨", "▶", "🔒", "🎬", "⭐", "◎", "☀", "⟲", "⚠", "⬅", "➡", "⬆", "⬇",
+            "📷", "✨", "▶", "🔒", "🎬", "⭐", "◎", "☀", "⟲", "⚠", "⬅", "➡", "⬆", "⬇", "⚙", "📍",
+            "🏠", "💬", "⚡", "🖼",
         ];
         assert_eq!(crate::widgets::missing_glyphs(&icons), Vec::<&str>::new());
     }

@@ -1,18 +1,25 @@
 //! Named profiles: complete sets of effect settings the user can switch
 //! between with one click. Each profile is one `key=value` file.
 
+use crate::conf::write_atomically;
 use crate::effects::{BeautyPreset, EffectSettings};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub const MAX_NAME_CHARS: usize = 24;
 /// Profiles reachable with Ctrl+1 … Ctrl+9.
 pub const SHORTCUTS: usize = 9;
 
+/// The built-in profile that switches every effect off. It is always first,
+/// and cannot be changed or deleted.
+pub const NEUTRAL: &str = "Neutral";
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct Profile {
     pub name: String,
     pub settings: EffectSettings,
+    /// Part of the app rather than a file the user saved.
+    pub builtin: bool,
 }
 
 pub struct ProfileStore {
@@ -77,13 +84,26 @@ impl ProfileStore {
                 let (Some(stem), Ok(text)) = (path.file_stem(), fs::read_to_string(&path)) else {
                     continue;
                 };
+                let name = stem.to_string_lossy().into_owned();
+                if name.eq_ignore_ascii_case(NEUTRAL) {
+                    continue; // the name belongs to the built-in profile
+                }
                 profiles.push(Profile {
-                    name: stem.to_string_lossy().into_owned(),
+                    name,
                     settings: EffectSettings::from_config(&text),
+                    builtin: false,
                 });
             }
         }
         profiles.sort_by_key(|profile| profile.name.to_lowercase());
+        profiles.insert(
+            0,
+            Profile {
+                name: NEUTRAL.to_owned(),
+                settings: EffectSettings::default(),
+                builtin: true,
+            },
+        );
         self.profiles = profiles;
     }
 
@@ -108,8 +128,10 @@ impl ProfileStore {
     /// Save `settings` under `name`, replacing a profile of the same name.
     pub fn save(&mut self, name: &str, settings: &EffectSettings) -> Result<String, String> {
         let name = clean_name(name)?;
-        fs::create_dir_all(&self.dir)
-            .and_then(|()| write_atomically(&self.path_of(&name), &settings.to_config()))
+        if name.eq_ignore_ascii_case(NEUTRAL) {
+            return Err(format!("“{NEUTRAL}” is built in. Choose another name."));
+        }
+        write_atomically(&self.path_of(&name), &settings.to_config())
             .map_err(|error| format!("Could not save the profile: {error}"))?;
         self.reload();
         self.current = Some(name.clone());
@@ -117,8 +139,12 @@ impl ProfileStore {
     }
 
     pub fn delete(&mut self, name: &str) -> Result<(), String> {
-        if self.find(name).is_none() {
-            return Err("That profile no longer exists.".into());
+        match self.find(name) {
+            None => return Err("That profile no longer exists.".into()),
+            Some(profile) if profile.builtin => {
+                return Err(format!("“{NEUTRAL}” is built in and cannot be deleted."));
+            }
+            Some(_) => {}
         }
         fs::remove_file(self.path_of(name))
             .map_err(|error| format!("Could not delete the profile: {error}"))?;
@@ -128,12 +154,6 @@ impl ProfileStore {
         self.reload();
         Ok(())
     }
-}
-
-fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
-    let temporary = path.with_extension("conf.tmp");
-    fs::write(&temporary, text)?;
-    fs::rename(&temporary, path)
 }
 
 /// Profiles written on first launch so the bar is not empty.
@@ -199,12 +219,18 @@ mod tests {
         let dir = scratch("seed");
         let mut store = ProfileStore::load(dir.clone(), true);
         let names: Vec<&str> = store.profiles.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["Incognito", "Meeting", "Party", "Studio"]);
-        assert!(store.profiles.iter().all(|p| p.settings.any_active()));
+        assert_eq!(
+            names,
+            ["Neutral", "Incognito", "Meeting", "Party", "Studio"]
+        );
+        assert!(store
+            .profiles
+            .iter()
+            .all(|p| p.builtin != p.settings.any_active()));
         for name in ["Incognito", "Meeting", "Party", "Studio"] {
             store.delete(name).unwrap();
         }
-        assert!(ProfileStore::load(dir.clone(), true).profiles.is_empty());
+        assert_eq!(ProfileStore::load(dir.clone(), true).profiles.len(), 1);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -212,7 +238,7 @@ mod tests {
     fn saved_profiles_round_trip_and_can_be_updated_and_deleted() {
         let dir = scratch("save");
         let mut store = ProfileStore::load(dir.clone(), false);
-        assert!(store.profiles.is_empty());
+        assert_eq!(store.profiles.len(), 1);
         let mut settings = EffectSettings {
             look: 4,
             grain: 0.25,
@@ -227,16 +253,23 @@ mod tests {
         let reloaded = ProfileStore::load(dir.clone(), false);
         assert_eq!(reloaded.find("Stream").unwrap().settings, settings);
         assert_eq!(reloaded.matching(&settings).unwrap().name, "Stream");
-        assert!(reloaded.matching(&EffectSettings::default()).is_none());
+        assert_eq!(
+            reloaded.matching(&EffectSettings::default()).unwrap().name,
+            NEUTRAL
+        );
 
         settings.grain = 0.75;
         store.save("Stream", &settings).unwrap();
-        assert_eq!(store.profiles.len(), 1);
+        assert_eq!(store.profiles.len(), 2);
         assert_eq!(store.find("Stream").unwrap().settings.grain, 0.75);
 
         store.delete("Stream").unwrap();
         assert!(store.delete("Stream").is_err());
-        assert!(store.profiles.is_empty() && store.current.is_none());
+        assert!(store.profiles.len() == 1 && store.current.is_none());
+        // The built-in profile is always there and cannot be touched.
+        assert!(store.profiles[0].builtin && !store.profiles[0].settings.any_active());
+        assert!(store.save("neutral", &settings).is_err());
+        assert!(store.delete(NEUTRAL).is_err());
         let _ = fs::remove_dir_all(dir);
     }
 }

@@ -68,7 +68,13 @@ impl Preview {
         self.connected = false;
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui) {
+    /// Forget the GPU texture; call when the window closes (it belongs to it).
+    pub fn forget_texture(&mut self) {
+        self.texture = None;
+    }
+
+    /// Draw the latest frame. Returns the rectangle the picture occupies.
+    pub fn show(&mut self, ui: &mut egui::Ui) -> Option<egui::Rect> {
         loop {
             match self.rx.try_recv() {
                 Ok(img) => {
@@ -97,14 +103,17 @@ impl Preview {
                 let tex_size = tex.size_vec2();
                 let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y);
                 let size = tex_size * scale;
+                let area = ui.available_rect_before_wrap();
                 ui.centered_and_justified(|ui| {
                     ui.add(egui::Image::new((tex.id(), size)));
                 });
+                Some(egui::Rect::from_center_size(area.center(), size))
             }
             None => {
                 ui.centered_and_justified(|ui| {
                     ui.label("waiting for video…");
                 });
+                None
             }
         }
     }

@@ -16,5 +16,8 @@ curl --fail --location --retry 3 \
 curl --fail --location --retry 3 \
   --output "$model_dir/selfie_segmenter.tflite" \
   "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/1/selfie_segmenter.tflite"
+curl --fail --location --retry 3 \
+  --output "$model_dir/hand_landmarker.task" \
+  "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
 
 echo "Effects runtime installed in $venv_dir"

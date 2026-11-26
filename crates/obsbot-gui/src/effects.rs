@@ -1,10 +1,13 @@
 //! Effects state: the catalogue of filters, the user's settings, and the
 //! worker process that renders them into the virtual camera.
 
+use crate::backgrounds::BackdropLibrary;
+use crate::conf::{config_dir, flag, one_line, parse_lines, write_atomically};
 use crate::luts::LutLibrary;
+use crate::paths;
+use crate::positions::{corners_text, Corners};
 use crate::preview::Preview;
 use crate::profiles::ProfileStore;
-use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -269,15 +272,174 @@ pub const ANONYMISE_STYLES: [Choice; 3] = [
     choice("bar", "Black", "", "Blacked-out"),
 ];
 
+/// How the name badge is drawn; `hint` describes the look.
+pub const BADGE_STYLES: [Choice; 5] = [
+    choice("bar", "Bar", "", "Dark panel with a coloured bar"),
+    choice(
+        "underline",
+        "Line",
+        "",
+        "Dark panel with a coloured underline",
+    ),
+    choice("pill", "Pill", "", "Rounded panel with a coloured dot"),
+    choice("block", "Block", "", "Solid panel in the badge colour"),
+    choice("plain", "Plain", "", "Text only, with a soft shadow"),
+];
+
+pub const BADGE_LAYOUTS: [Choice; 2] = [
+    choice(
+        "stacked",
+        "Title below",
+        "",
+        "Name with the title underneath",
+    ),
+    choice("inline", "One line", "", "Name and title side by side"),
+];
+
+/// Where the badge sits, as rows of a 3×2 picker (top row first).
+pub const BADGE_POSITIONS: [&str; 6] = [
+    "top-left",
+    "top-center",
+    "top-right",
+    "bottom-left",
+    "bottom-center",
+    "bottom-right",
+];
+
+pub const BADGE_COLORS: [Tint; 8] = [
+    tint("purple", "Purple", [116, 105, 255]),
+    tint("blue", "Blue", [70, 150, 255]),
+    tint("teal", "Teal", [40, 190, 190]),
+    tint("green", "Green", [67, 211, 145]),
+    tint("amber", "Amber", [255, 184, 92]),
+    tint("red", "Red", [246, 105, 116]),
+    tint("pink", "Pink", [255, 110, 190]),
+    tint("white", "White", [240, 240, 245]),
+];
+
+/// The look and placement of the name badge.
+#[derive(Clone, PartialEq, Debug)]
+pub struct BadgeDesign {
+    /// Font family; empty uses the system's default sans-serif.
+    pub font: String,
+    pub bold: bool,
+    pub caps: bool,
+    pub size: f32,
+    pub position: usize,
+    pub style: usize,
+    pub layout: usize,
+    pub color: usize,
+    /// How solid the panel behind the text is.
+    pub opacity: f32,
+    /// Distance from the edge of the picture.
+    pub margin: f32,
+}
+
+impl Default for BadgeDesign {
+    fn default() -> Self {
+        Self {
+            font: String::new(),
+            bold: true,
+            caps: false,
+            size: 0.35,
+            position: 3,
+            style: 0,
+            layout: 0,
+            color: 0,
+            opacity: 0.8,
+            margin: 0.35,
+        }
+    }
+}
+
+impl BadgeDesign {
+    fn to_config(&self) -> String {
+        let [r, g, b] = BADGE_COLORS[self.color].rgb;
+        format!(
+            "badge_font={}\nbadge_bold={}\nbadge_caps={}\nbadge_size={}\nbadge_position={}\n\
+             badge_style={}\nbadge_layout={}\nbadge_accent={r},{g},{b}\nbadge_opacity={}\n\
+             badge_margin={}\n",
+            one_line(&self.font),
+            self.bold,
+            self.caps,
+            self.size,
+            BADGE_POSITIONS[self.position],
+            BADGE_STYLES[self.style].key,
+            BADGE_LAYOUTS[self.layout].key,
+            self.opacity,
+            self.margin,
+        )
+    }
+
+    fn from_values(values: &std::collections::HashMap<&str, &str>) -> Self {
+        let defaults = Self::default();
+        let unit = |key: &str, default: f32| -> f32 {
+            values
+                .get(key)
+                .and_then(|value| value.parse::<f32>().ok())
+                .filter(|value| value.is_finite())
+                .map_or(default, |value| value.clamp(0.0, 1.0))
+        };
+        let pick = |key: &str, keys: &[&str], default: usize| -> usize {
+            values
+                .get(key)
+                .and_then(|value| keys.iter().position(|candidate| candidate == value))
+                .unwrap_or(default)
+        };
+        let accent = values.get("badge_accent").copied().unwrap_or_default();
+        Self {
+            font: values
+                .get("badge_font")
+                .map(|value| (*value).to_owned())
+                .unwrap_or_default(),
+            bold: flag(values, "badge_bold", defaults.bold),
+            caps: flag(values, "badge_caps", defaults.caps),
+            size: unit("badge_size", defaults.size),
+            position: pick("badge_position", &BADGE_POSITIONS, defaults.position),
+            style: pick("badge_style", &BADGE_STYLES.each_ref().map(|c| c.key), 0),
+            layout: pick("badge_layout", &BADGE_LAYOUTS.each_ref().map(|c| c.key), 0),
+            color: BADGE_COLORS
+                .iter()
+                .position(|tint| {
+                    let [r, g, b] = tint.rgb;
+                    format!("{r},{g},{b}") == accent
+                })
+                .unwrap_or(0),
+            opacity: unit("badge_opacity", defaults.opacity),
+            margin: unit("badge_margin", defaults.margin),
+        }
+    }
+}
+
 /// Expression-triggered effects: `label` is what you do, `hint` what happens.
-pub const TRIGGERS: [Choice; 5] = [
+/// Colours for the question marks and the idea stars.
+pub const MAGIC_COLORS: [Tint; 8] = [
+    tint("blue", "Blue", [120, 190, 255]),
+    tint("gold", "Gold", [255, 205, 60]),
+    tint("pink", "Pink", [255, 130, 200]),
+    tint("green", "Green", [110, 225, 120]),
+    tint("purple", "Purple", [180, 120, 255]),
+    tint("red", "Red", [245, 80, 80]),
+    tint("orange", "Orange", [255, 150, 50]),
+    tint("white", "White", [245, 245, 245]),
+];
+
+/// Positions in `TRIGGERS` of the effects that have a colour setting.
+pub const QUESTIONS: usize = 2;
+pub const IDEA: usize = 6;
+/// Position of the storm in `TRIGGERS`; it has a sensitivity setting.
+pub const STORM: usize = 4;
+/// Triggers from here on watch your hands and need the hand-tracking model.
+pub const FIRST_GESTURE: usize = 5;
+
+pub const TRIGGERS: [Choice; 8] = [
     choice("hearts", "Smile", "😊", "Hearts float up around you"),
     choice("rainbow", "Open your mouth", "😮", "A rainbow pours out"),
     choice(
-        "stars",
+        "questions",
         "Raise your eyebrows",
-        "😲",
-        "Stars burst from your head",
+        "❓",
+        "Question marks rise from your head",
     ),
     choice("kisses", "Blow a kiss", "😘", "Little hearts fly away"),
     choice(
@@ -285,6 +447,24 @@ pub const TRIGGERS: [Choice; 5] = [
         "Look concerned",
         "😟",
         "A thundercloud rains on you",
+    ),
+    choice(
+        "applause",
+        "Clap your hands",
+        "👏",
+        "Clapping hands rise around you",
+    ),
+    choice(
+        "idea",
+        "Raise your index finger",
+        "💡",
+        "Great idea: stars explode from your head",
+    ),
+    choice(
+        "fireworks",
+        "Shake your fist",
+        "🎆",
+        "Celebrate: fireworks go off around you",
     ),
 ];
 
@@ -438,9 +618,12 @@ pub const LIGHT_PRESETS: [LightPreset; 8] = [
 const TRIGGER_NAMES: [&str; TRIGGERS.len()] = [
     "Smile hearts",
     "Mouth rainbow",
-    "Eyebrow stars",
+    "Eyebrow questions",
     "Kiss hearts",
     "Storm cloud",
+    "Applause",
+    "Idea stars",
+    "Fireworks",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -476,7 +659,7 @@ impl Group {
             Group::Funny => "Funny",
             Group::Magic => "Magic",
             Group::Paint => "Paint",
-            Group::Backdrop => "Backdrop",
+            Group::Backdrop => "Scene",
         }
     }
 
@@ -502,7 +685,7 @@ impl Group {
             Group::Funny => "Funny faces",
             Group::Magic => "Magic moments",
             Group::Paint => "Face paint",
-            Group::Backdrop => "Backdrop",
+            Group::Backdrop => "Scene",
         }
     }
 }
@@ -513,6 +696,7 @@ pub enum Active {
     Look,
     Lut,
     Finish,
+    AutoCorrect,
     Lights,
     Beauty,
     Sticker(usize),
@@ -521,6 +705,30 @@ pub enum Active {
     Anonymise,
     Trigger(usize),
     Backdrop,
+    AutoFrame,
+    Badge,
+    Logo,
+}
+
+/// A stand-in picture shown instead of the live one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Hold {
+    #[default]
+    Off,
+    /// The last picture, frozen.
+    Freeze,
+    /// A "be right back" card.
+    Card,
+}
+
+impl Hold {
+    fn key(self) -> &'static str {
+        match self {
+            Hold::Off => "off",
+            Hold::Freeze => "freeze",
+            Hold::Card => "card",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -563,6 +771,11 @@ pub struct EffectSettings {
     pub anonymise: usize,
     pub anonymise_style: usize,
     pub anonymise_amount: f32,
+    /// How readily a concerned look starts the storm (0 = only a deep frown).
+    pub storm_sensitivity: f32,
+    /// Indexes into `MAGIC_COLORS`.
+    pub question_color: usize,
+    pub star_color: usize,
     pub triggers: [bool; TRIGGERS.len()],
     /// Key light brightness; `light_x`/`light_y` place it (-1..1, +y is up).
     pub light_key: f32,
@@ -573,7 +786,18 @@ pub struct EffectSettings {
     pub light_rim: f32,
     pub light_rim_color: usize,
     pub light_dim: f32,
+    /// Automatic exposure and colour correction, 0 = off.
+    pub auto_enhance: f32,
+    pub autoframe_on: bool,
+    /// How tightly auto-framing crops: 0 = wide, 1 = close-up.
+    pub autoframe: f32,
+    /// How many people effects follow (1..=MAX_FACES).
+    pub faces: usize,
+    pub badge: bool,
+    pub logo: bool,
 }
+
+pub const MAX_FACES: usize = 4;
 
 impl Default for EffectSettings {
     fn default() -> Self {
@@ -607,6 +831,9 @@ impl Default for EffectSettings {
             anonymise: 0,
             anonymise_style: 0,
             anonymise_amount: 0.5,
+            storm_sensitivity: 0.5,
+            question_color: 0,
+            star_color: 1,
             triggers: [false; TRIGGERS.len()],
             light_key: 0.0,
             light_x: LIGHT_X,
@@ -616,6 +843,12 @@ impl Default for EffectSettings {
             light_rim: 0.0,
             light_rim_color: 0,
             light_dim: 0.0,
+            auto_enhance: 0.0,
+            autoframe_on: false,
+            autoframe: 0.5,
+            faces: 1,
+            badge: false,
+            logo: false,
         }
     }
 }
@@ -670,6 +903,9 @@ impl EffectSettings {
             &ANONYMISE_STYLES[self.anonymise_style].key,
         );
         put("anonymise_amount", &self.anonymise_amount);
+        put("storm_sensitivity", &self.storm_sensitivity);
+        put("question_color", &MAGIC_COLORS[self.question_color].key);
+        put("star_color", &MAGIC_COLORS[self.star_color].key);
         put("triggers", &join_enabled(&TRIGGERS, &self.triggers));
         put("light_key", &self.light_key);
         put("light_x", &self.light_x);
@@ -679,6 +915,12 @@ impl EffectSettings {
         put("light_rim", &self.light_rim);
         put("light_rim_color", &RIM_COLORS[self.light_rim_color].key);
         put("light_dim", &self.light_dim);
+        put("auto_enhance", &self.auto_enhance);
+        put("autoframe_on", &self.autoframe_on);
+        put("autoframe", &self.autoframe);
+        put("faces", &self.faces);
+        put("badge", &self.badge);
+        put("logo_on", &self.logo);
         out
     }
 
@@ -705,6 +947,12 @@ impl EffectSettings {
                 .get(key)
                 .and_then(|value| keys.iter().position(|candidate| candidate == value))
                 .unwrap_or(0)
+        };
+        let named = |key: &str, default: usize| -> usize {
+            values
+                .get(key)
+                .and_then(|value| MAGIC_COLORS.iter().position(|tint| tint.key == *value))
+                .unwrap_or(default)
         };
         let flags = |key: &str, choices: &[Choice], flags: &mut [bool]| {
             let Some(list) = values.get(key) else { return };
@@ -753,6 +1001,9 @@ impl EffectSettings {
                 &ANONYMISE_STYLES.each_ref().map(|c| c.key),
             ),
             anonymise_amount: unit("anonymise_amount", defaults.anonymise_amount),
+            storm_sensitivity: unit("storm_sensitivity", defaults.storm_sensitivity),
+            question_color: named("question_color", defaults.question_color),
+            star_color: named("star_color", defaults.star_color),
             triggers: defaults.triggers,
             light_key: unit("light_key", 0.0),
             light_x: signed("light_x", LIGHT_X),
@@ -762,6 +1013,15 @@ impl EffectSettings {
             light_rim: unit("light_rim", 0.0),
             light_rim_color: index("light_rim_color", &RIM_COLORS.each_ref().map(|t| t.key)),
             light_dim: unit("light_dim", 0.0),
+            auto_enhance: unit("auto_enhance", 0.0),
+            autoframe_on: flag(&values, "autoframe_on", false),
+            autoframe: unit("autoframe", defaults.autoframe),
+            faces: values
+                .get("faces")
+                .and_then(|value| value.parse::<usize>().ok())
+                .map_or(1, |count| count.clamp(1, MAX_FACES)),
+            badge: flag(&values, "badge", false),
+            logo: flag(&values, "logo_on", false),
         };
         flags("stickers", &STICKERS, &mut settings.stickers);
         flags("triggers", &TRIGGERS, &mut settings.triggers);
@@ -832,6 +1092,9 @@ impl EffectSettings {
         if self.finish_active() {
             list.push((Active::Finish, "Film finish".to_owned()));
         }
+        if self.auto_enhance > ON {
+            list.push((Active::AutoCorrect, "Auto-correct".to_owned()));
+        }
         if self.lights_active() {
             let name = match self.light_preset() {
                 Some(index) => format!("{} lights", LIGHT_PRESETS[index].label),
@@ -877,6 +1140,15 @@ impl EffectSettings {
                 format!("{} backdrop", BACKGROUNDS[self.background].label),
             ));
         }
+        if self.autoframe_on {
+            list.push((Active::AutoFrame, "Auto-framing".to_owned()));
+        }
+        if self.badge {
+            list.push((Active::Badge, "Name badge".to_owned()));
+        }
+        if self.logo {
+            list.push((Active::Logo, "Logo".to_owned()));
+        }
         list
     }
 
@@ -887,7 +1159,12 @@ impl EffectSettings {
     /// True when an enabled effect cannot work without seeing a face.
     pub fn needs_face(&self) -> bool {
         self.active().iter().any(|(active, _)| match active {
-            Active::Look | Active::Lut | Active::Finish | Active::Backdrop => false,
+            Active::Look
+            | Active::Lut
+            | Active::Finish
+            | Active::Backdrop
+            | Active::Badge
+            | Active::Logo => false,
             // Fill, rim and dimming work from the person outline alone.
             Active::Lights => self.light_key > ON,
             _ => true,
@@ -924,6 +1201,10 @@ impl EffectSettings {
             Active::Anonymise => self.anonymise = 0,
             Active::Trigger(index) => self.triggers[index] = false,
             Active::Backdrop => self.background = 0,
+            Active::AutoCorrect => self.auto_enhance = 0.0,
+            Active::AutoFrame => self.autoframe_on = false,
+            Active::Badge => self.badge = false,
+            Active::Logo => self.logo = false,
         }
     }
 
@@ -948,13 +1229,22 @@ impl EffectSettings {
                 self.lut_strength = defaults.lut_strength;
             }
             Group::Funny => self.distortion_strength = defaults.distortion_strength,
+            Group::Magic => {
+                self.storm_sensitivity = defaults.storm_sensitivity;
+                self.question_color = defaults.question_color;
+                self.star_color = defaults.star_color;
+            }
             Group::Paint => {
                 self.paint_strength = defaults.paint_strength;
                 self.anonymise_style = defaults.anonymise_style;
                 self.anonymise_amount = defaults.anonymise_amount;
             }
-            Group::Backdrop => self.blur = defaults.blur,
-            Group::Lights | Group::Beauty | Group::Stickers | Group::Magic => {}
+            Group::Backdrop => {
+                self.blur = defaults.blur;
+                self.autoframe = defaults.autoframe;
+                self.faces = defaults.faces;
+            }
+            Group::Lights | Group::Beauty | Group::Stickers => {}
         }
     }
 
@@ -989,21 +1279,14 @@ impl EffectSettings {
 fn group_of(active: Active) -> Group {
     match active {
         Active::Look | Active::Lut | Active::Finish => Group::Looks,
-        Active::Lights => Group::Lights,
+        Active::AutoCorrect | Active::Lights => Group::Lights,
         Active::Beauty => Group::Beauty,
         Active::Sticker(_) => Group::Stickers,
         Active::Distortion => Group::Funny,
         Active::Trigger(_) => Group::Magic,
         Active::Paint | Active::Anonymise => Group::Paint,
-        Active::Backdrop => Group::Backdrop,
+        Active::Backdrop | Active::AutoFrame | Active::Badge | Active::Logo => Group::Backdrop,
     }
-}
-
-fn parse_lines(text: &str) -> HashMap<&str, &str> {
-    text.lines()
-        .filter_map(|line| line.split_once('='))
-        .map(|(key, value)| (key.trim(), value.trim()))
-        .collect()
 }
 
 /// Health report written by the effects worker about once a second.
@@ -1033,17 +1316,118 @@ pub struct Notice {
     pub is_error: bool,
 }
 
+/// Output settings that apply whatever profile is active.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Session {
+    pub mirror: bool,
+    pub flip: bool,
+    /// Whiteboard corners to straighten, set by the current camera position.
+    pub keystone: Option<Corners>,
+    /// True while corners are being dragged: the picture is shown unstraightened.
+    pub adjusting: bool,
+    pub hold: Hold,
+    pub hold_text: String,
+    pub badge_name: String,
+    pub badge_title: String,
+    pub badge_design: BadgeDesign,
+    pub logo_path: String,
+}
+
+impl Session {
+    fn from_values(values: &std::collections::HashMap<&str, &str>) -> Self {
+        let text = |key: &str, default: &str| -> String {
+            values.get(key).map_or(default, |value| *value).to_owned()
+        };
+        Self {
+            mirror: flag(values, "mirror", false),
+            flip: flag(values, "flip", false),
+            keystone: None,
+            adjusting: false,
+            hold: Hold::Off,
+            hold_text: text("hold_text", "Be right back"),
+            badge_name: text("badge_name", ""),
+            badge_title: text("badge_title", ""),
+            badge_design: BadgeDesign::from_values(values),
+            logo_path: text("logo_path", ""),
+        }
+    }
+
+    /// True when something here needs the worker even with every effect off.
+    fn needs_worker(&self) -> bool {
+        self.mirror || self.flip || self.keystone.is_some() || self.hold != Hold::Off
+    }
+}
+
+/// What other apps can currently get from the virtual camera.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Broadcast {
+    /// The loopback device does not exist on this system.
+    NotSetUp,
+    /// The device exists, but nothing is sent, so apps do not list it.
+    Idle,
+    /// Effects run in the preview only and are about to move to the device.
+    Connecting,
+    /// Sending; `viewers` other programs have the camera open.
+    Live { viewers: usize },
+}
+
+impl Broadcast {
+    pub fn of(device: bool, enabled: bool, publishing: bool, viewers: usize) -> Self {
+        match (device, enabled, publishing) {
+            (false, _, _) => Self::NotSetUp,
+            (true, false, _) => Self::Idle,
+            (true, true, false) => Self::Connecting,
+            (true, true, true) => Self::Live { viewers },
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            Self::NotSetUp => "NOT SET UP".into(),
+            Self::Idle => "READY".into(),
+            Self::Connecting => "CONNECTING".into(),
+            Self::Live { viewers: 0 } => "ON AIR".into(),
+            Self::Live { viewers: 1 } => "ON AIR  •  1 app".into(),
+            Self::Live { viewers } => format!("ON AIR  •  {viewers} apps"),
+        }
+    }
+
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::NotSetUp => {
+                "Other apps cannot see your effects yet. Run \
+                 scripts/setup-virtual-camera.sh --persist once; no restart needed."
+            }
+            Self::Idle => "Set up. It only appears in other apps while the effects camera is on.",
+            Self::Connecting => "Moving your effects to the virtual camera…",
+            Self::Live { viewers: 0 } => {
+                "Choose “OBSBOT Virtual Camera” in your video app. If it is not \
+                 listed, reload the page or restart the app."
+            }
+            Self::Live { .. } => "Another app is showing your effects camera right now.",
+        }
+    }
+}
+
 pub struct EffectsController {
     pub enabled: bool,
     /// True when the worker also feeds the system-wide virtual camera;
     /// false means the effects are visible in the preview only.
     pub publishing: bool,
+    /// The loopback device, looked up again every second.
+    pub virtual_camera: Option<PathBuf>,
+    /// Other programs that have the virtual camera open.
+    pub viewers: usize,
+    last_device_check: Instant,
     pub resolution: usize,
     pub fps: u32,
     pub settings: EffectSettings,
+    pub session: Session,
     pub notice: Option<Notice>,
     pub status: Option<WorkerStatus>,
     pub luts: LutLibrary,
+    pub backdrops: BackdropLibrary,
+    pub fonts: crate::fonts::FontList,
     pub profiles: ProfileStore,
     process: Option<Child>,
     config_path: PathBuf,
@@ -1052,12 +1436,16 @@ pub struct EffectsController {
     /// Set after a failed automatic start, or when the user switches the
     /// camera off, so that editing an effect does not start it again.
     autostart_blocked: bool,
+    /// Whether the app window is open; without it the worker sends no preview.
+    window_open: bool,
+    /// The worker was stopped only because nothing could see its picture.
+    resume_when_shown: bool,
 }
 
 impl EffectsController {
     /// Restore the settings from the last session, if any.
     pub fn load() -> Self {
-        Self::from_file(config_path(), true)
+        Self::from_file(config_dir().join("effects.conf"), true)
     }
 
     fn from_file(config_path: PathBuf, seed_profiles: bool) -> Self {
@@ -1078,15 +1466,21 @@ impl EffectsController {
         Self {
             enabled: false,
             publishing: false,
+            virtual_camera: find_virtual_camera(),
+            viewers: 0,
+            last_device_check: Instant::now(),
             resolution,
             fps,
             settings: EffectSettings::from_config(&text),
+            session: Session::from_values(&values),
             notice: None,
             status: None,
-            luts: LutLibrary::new(
-                repository_root().join("effects/luts"),
-                config_path.with_file_name("luts"),
+            luts: LutLibrary::new(paths::bundled("luts"), config_path.with_file_name("luts")),
+            backdrops: BackdropLibrary::new(
+                paths::bundled("backgrounds"),
+                config_path.with_file_name("backgrounds"),
             ),
+            fonts: crate::fonts::FontList::default(),
             profiles: ProfileStore::load(config_path.with_file_name("profiles"), seed_profiles),
             process: None,
             config_path,
@@ -1094,6 +1488,8 @@ impl EffectsController {
                 .join(format!("obsbot-effects-{}.status", std::process::id())),
             last_status_read: Instant::now(),
             autostart_blocked: false,
+            window_open: true,
+            resume_when_shown: false,
         }
     }
 
@@ -1101,23 +1497,47 @@ impl EffectsController {
         RESOLUTIONS[self.resolution.min(RESOLUTIONS.len() - 1)]
     }
 
+    /// Everything the worker reads: the profile-able settings, then the
+    /// session's additions and overrides (later lines win).
+    pub fn worker_config(&self) -> String {
+        let session = &self.session;
+        let resolution = self.selected_resolution();
+        let mut out = self.settings.to_config();
+        let mut put = |key: &str, value: &dyn std::fmt::Display| {
+            out.push_str(&format!("{key}={value}\n"));
+        };
+        put("mirror", &session.mirror);
+        put("flip", &session.flip);
+        put("hold", &session.hold.key());
+        put("hold_text", &one_line(&session.hold_text));
+        put("badge_name", &one_line(&session.badge_name));
+        put("badge_title", &one_line(&session.badge_title));
+        out.push_str(&session.badge_design.to_config());
+        let mut put = |key: &str, value: &dyn std::fmt::Display| {
+            out.push_str(&format!("{key}={value}\n"));
+        };
+        put("logo_path", &one_line(&session.logo_path));
+        if self.settings.logo {
+            put("logo", &one_line(&session.logo_path));
+        }
+        if session.adjusting {
+            // Show the plain picture while whiteboard corners are placed.
+            put("autoframe_on", &false);
+        } else if let Some(corners) = &session.keystone {
+            put("keystone", &corners_text(corners));
+        }
+        put("preview", &self.window_open);
+        put(
+            "output",
+            &format!("{}x{}", resolution.width, resolution.height),
+        );
+        put("fps", &self.fps);
+        out
+    }
+
     /// Persist the settings. The running worker picks the change up live.
     pub fn save(&self) -> io::Result<()> {
-        let resolution = self.selected_resolution();
-        let config = format!(
-            "{}output={}x{}\nfps={}\n",
-            self.settings.to_config(),
-            resolution.width,
-            resolution.height,
-            self.fps
-        );
-        if let Some(parent) = self.config_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        // Write-then-rename so the worker never reads a half-written file.
-        let temporary = self.config_path.with_extension("conf.tmp");
-        fs::write(&temporary, config)?;
-        fs::rename(&temporary, &self.config_path)
+        write_atomically(&self.config_path, &self.worker_config())
     }
 
     fn fail(&mut self, text: String) {
@@ -1127,14 +1547,19 @@ impl EffectsController {
         });
     }
 
-    /// Call after any settings edit: saves, and starts the virtual camera the
-    /// first time an effect is switched on so the change is visible at once.
+    /// True when any effect or session option needs the worker running.
+    pub fn wants_worker(&self) -> bool {
+        self.settings.any_active() || self.session.needs_worker()
+    }
+
+    /// Call after any settings edit: saves, and starts the effects camera the
+    /// first time something is switched on so the change is visible at once.
     pub fn settings_changed(&mut self, input: Option<&Path>, preview: &mut Preview) {
         if let Err(error) = self.save() {
             self.fail(format!("Could not save effects: {error}"));
             return;
         }
-        if self.starts_automatically() && self.settings.any_active() {
+        if self.starts_automatically() && self.wants_worker() {
             if let Some(input) = input {
                 if self.start(input, preview).is_err() {
                     self.autostart_blocked = true;
@@ -1145,13 +1570,16 @@ impl EffectsController {
 
     /// True while switching an effect on will start the camera by itself.
     pub fn starts_automatically(&self) -> bool {
-        !self.enabled && !self.autostart_blocked
+        !self.enabled && !self.autostart_blocked && self.window_open
     }
 
     /// The user switched the camera off: stop, and stay off until asked.
     pub fn stop_by_user(&mut self, preview: &mut Preview) {
+        self.session.hold = Hold::Off;
+        self.resume_when_shown = false;
         self.stop(preview);
         self.autostart_blocked = true;
+        let _ = self.save();
     }
 
     /// Switch to the saved profile at `index` (as listed), if there is one.
@@ -1165,8 +1593,96 @@ impl EffectsController {
         self.settings_changed(input, preview);
     }
 
+    /// Switch to the profile called `name`. Returns false if there is none.
+    pub fn apply_profile_named(
+        &mut self,
+        name: &str,
+        input: Option<&Path>,
+        preview: &mut Preview,
+    ) -> bool {
+        let wanted = name.trim().to_lowercase();
+        let found = self
+            .profiles
+            .profiles
+            .iter()
+            .position(|profile| profile.name.to_lowercase() == wanted);
+        if let Some(index) = found {
+            self.apply_profile(index, input, preview);
+        }
+        found.is_some()
+    }
+
+    /// Move `step` profiles forwards or backwards from the current one.
+    pub fn step_profile(&mut self, step: i32, input: Option<&Path>, preview: &mut Preview) {
+        let count = self.profiles.profiles.len() as i32;
+        if count == 0 {
+            return;
+        }
+        let current = self
+            .profiles
+            .matching(&self.settings)
+            .map(|profile| profile.name.clone())
+            .or_else(|| self.profiles.current.clone())
+            .and_then(|name| self.profiles.profiles.iter().position(|p| p.name == name));
+        let next = match current {
+            Some(index) => (index as i32 + step).rem_euclid(count),
+            None if step >= 0 => 0,
+            None => count - 1,
+        };
+        self.apply_profile(next as usize, input, preview);
+    }
+
+    /// Show or clear the stand-in picture. Showing it starts the worker if
+    /// needed, because the point is that other apps see it.
+    pub fn set_hold(&mut self, hold: Hold, input: Option<&Path>, preview: &mut Preview) {
+        self.session.hold = hold;
+        if let Err(error) = self.save() {
+            self.fail(format!("Could not save effects: {error}"));
+        }
+        if hold != Hold::Off && !self.enabled {
+            if let Some(input) = input {
+                let _ = self.start(input, preview);
+            }
+        }
+    }
+
+    /// Tell the controller whether the app window is open. With it closed the
+    /// worker stops sending preview frames, and stops entirely when no other
+    /// app could see its picture either.
+    pub fn set_window_open(&mut self, open: bool, input: Option<&Path>, preview: &mut Preview) {
+        if open == self.window_open {
+            return;
+        }
+        self.window_open = open;
+        if open {
+            if std::mem::take(&mut self.resume_when_shown) {
+                if let Some(input) = input {
+                    let _ = self.start(input, preview);
+                }
+            } else if self.enabled {
+                let _ = self.save();
+            } else {
+                preview.show_camera();
+            }
+        } else if self.enabled && !self.publishing {
+            self.stop(preview);
+            self.resume_when_shown = true;
+            preview.pause();
+        } else if self.enabled {
+            let _ = self.save();
+        } else {
+            // Nothing is watching: let go of the camera altogether.
+            preview.pause();
+        }
+    }
+
     /// Start (or restart) the worker. Errors are also stored in `notice`.
     pub fn start(&mut self, input: &Path, preview: &mut Preview) -> Result<(), ()> {
+        if !self.window_open && find_virtual_camera().is_none() {
+            // Nobody could see the picture: wait until the window is opened.
+            self.resume_when_shown = true;
+            return Ok(());
+        }
         self.stop(preview);
         match self.spawn(input, preview) {
             Ok(()) => {
@@ -1175,6 +1691,9 @@ impl EffectsController {
             }
             Err(text) => {
                 self.fail(text);
+                if !self.window_open {
+                    preview.pause();
+                }
                 Err(())
             }
         }
@@ -1183,18 +1702,14 @@ impl EffectsController {
     fn spawn(&mut self, input: &Path, preview: &mut Preview) -> Result<(), String> {
         // Optional: without it the effects still show in the preview.
         let output = find_virtual_camera();
-        let root = repository_root();
-        let python = root.join(".effects-venv/bin/python");
-        if !python.exists() {
-            return Err("Effects runtime not installed. Run: bash scripts/setup-effects.sh".into());
-        }
-        let processor = root.join("effects/processor.py");
-        let model_dir = root.join("effects/models");
-        if !model_dir.join("face_landmarker.task").exists()
-            || !model_dir.join("selfie_segmenter.tflite").exists()
-        {
-            return Err("MediaPipe models are missing. Run: bash scripts/setup-effects.sh".into());
-        }
+        let hint = paths::setup_hint();
+        let python =
+            paths::python().ok_or_else(|| format!("Effects runtime not installed. {hint}"))?;
+        let processor = paths::effects_dir()
+            .map(|dir| dir.join("processor.py"))
+            .ok_or_else(|| format!("Effects files are missing. {hint}"))?;
+        let model_dir =
+            paths::models_dir().ok_or_else(|| format!("MediaPipe models are missing. {hint}"))?;
         self.save()
             .map_err(|error| format!("Could not save effects: {error}"))?;
         let resolution = self.selected_resolution();
@@ -1261,8 +1776,27 @@ impl EffectsController {
         }
         let _ = fs::remove_file(&self.status_path);
         self.enabled = false;
+        self.publishing = false;
         self.status = None;
         self.notice = None;
+    }
+
+    pub fn broadcast(&self) -> Broadcast {
+        let device = self.virtual_camera.is_some();
+        Broadcast::of(device, self.enabled, self.publishing, self.viewers)
+    }
+
+    /// Keep track of the virtual camera. Returns true when it has appeared
+    /// while effects run in the preview only, so the caller can restart the
+    /// worker and go live without the user switching anything.
+    pub fn watch_virtual_camera(&mut self) -> bool {
+        if self.last_device_check.elapsed() < Duration::from_secs(1) {
+            return false;
+        }
+        self.last_device_check = Instant::now();
+        let appeared = self.virtual_camera.is_none();
+        self.virtual_camera = find_virtual_camera();
+        appeared && self.virtual_camera.is_some() && self.enabled && !self.publishing
     }
 
     pub fn poll(&mut self, preview: &mut Preview) {
@@ -1273,10 +1807,15 @@ impl EffectsController {
             Ok(Some(status)) => {
                 self.process = None;
                 self.enabled = false;
+                self.publishing = false;
                 self.status = None;
                 self.autostart_blocked = true;
                 self.fail(format!("Effects worker stopped ({status})"));
-                preview.show_camera();
+                if self.window_open {
+                    preview.show_camera();
+                } else {
+                    preview.pause();
+                }
                 return;
             }
             Ok(None) => {}
@@ -1291,21 +1830,8 @@ impl EffectsController {
     }
 }
 
-fn repository_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-/// `$XDG_CONFIG_HOME/obsbot-control-center/effects.conf`, with fallbacks.
-fn config_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("obsbot-control-center").join("effects.conf")
-}
-
-fn find_virtual_camera() -> Option<PathBuf> {
+/// The loopback device other apps read the effects picture from, if set up.
+pub fn find_virtual_camera() -> Option<PathBuf> {
     let entries = fs::read_dir("/sys/class/video4linux").ok()?;
     for entry in entries.flatten() {
         let name = fs::read_to_string(entry.path().join("name")).ok()?;
@@ -1328,6 +1854,18 @@ impl EffectsController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broadcast_is_only_live_while_effects_feed_the_device() {
+        assert_eq!(Broadcast::of(false, true, false, 0), Broadcast::NotSetUp);
+        assert_eq!(Broadcast::of(true, false, false, 0), Broadcast::Idle);
+        assert_eq!(Broadcast::of(true, true, false, 0), Broadcast::Connecting);
+        let live = Broadcast::of(true, true, true, 2);
+        assert_eq!(live, Broadcast::Live { viewers: 2 });
+        assert_eq!(live.label(), "ON AIR  •  2 apps");
+        let texts = ["•", "…", "“", "”"];
+        assert_eq!(crate::widgets::missing_glyphs(&texts), Vec::<&str>::new());
+    }
 
     #[test]
     fn default_settings_have_no_active_effects() {
@@ -1367,6 +1905,9 @@ mod tests {
             anonymise: 2,
             anonymise_style: 1,
             anonymise_amount: 0.875,
+            storm_sensitivity: 0.25,
+            question_color: 4,
+            star_color: 2,
             light_key: 0.75,
             light_x: 0.25,
             light_y: -0.5,
@@ -1375,6 +1916,12 @@ mod tests {
             light_rim: 0.625,
             light_rim_color: 3,
             light_dim: 0.375,
+            auto_enhance: 0.75,
+            autoframe_on: true,
+            autoframe: 0.25,
+            faces: 3,
+            badge: true,
+            logo: true,
             ..EffectSettings::default()
         };
         settings.stickers[0] = true;
@@ -1499,6 +2046,90 @@ mod tests {
             .contains("anonymise=eyes\nanonymise_style=bar\n"));
         settings.reset(Group::Paint);
         assert_eq!(settings, EffectSettings::default());
+    }
+
+    #[test]
+    fn office_options_are_listed_and_only_framing_needs_a_face() {
+        let mut settings = EffectSettings {
+            badge: true,
+            logo: true,
+            auto_enhance: 0.6,
+            ..EffectSettings::default()
+        };
+        let names: Vec<String> = settings
+            .active()
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+        assert_eq!(names, ["Auto-correct", "Name badge", "Logo"]);
+        assert!(settings.needs_face(), "auto-correct exposes for the face");
+        settings.auto_enhance = 0.0;
+        assert!(!settings.needs_face());
+        settings.autoframe_on = true;
+        assert!(settings.needs_face());
+        settings.reset(Group::Backdrop);
+        assert!(!settings.any_active());
+    }
+
+    #[test]
+    fn worker_config_adds_session_options_and_overrides() {
+        let mut effects = EffectsController::for_tests();
+        effects.settings.logo = true;
+        effects.settings.autoframe_on = true;
+        effects.session.logo_path = "/logos/acme.png".into();
+        effects.session.badge_name = "Ada\nLovelace".into();
+        effects.session.mirror = true;
+        effects.session.keystone = Some(crate::positions::DEFAULT_CORNERS);
+        let config = effects.worker_config();
+        assert!(config.contains("logo=/logos/acme.png\n"));
+        assert!(config.contains("badge_name=Ada Lovelace\n"));
+        assert!(config.contains("mirror=true\n"));
+        assert!(config.contains("keystone=0.1500,0.1500,"));
+        assert!(config.contains("preview=true\n"));
+        assert!(effects.wants_worker());
+
+        effects.session.adjusting = true;
+        let adjusting = effects.worker_config();
+        assert!(!adjusting.contains("keystone="));
+        assert!(
+            adjusting.rfind("autoframe_on=false").unwrap()
+                > adjusting.find("autoframe_on=true").unwrap()
+        );
+
+        // Session options survive a reload; transient ones do not.
+        let values = parse_lines(&config);
+        let restored = Session::from_values(&values);
+        assert!(restored.mirror && restored.keystone.is_none() && restored.hold == Hold::Off);
+        assert_eq!(restored.logo_path, "/logos/acme.png");
+    }
+
+    #[test]
+    fn badge_design_round_trips_through_the_worker_config() {
+        let mut effects = EffectsController::for_tests();
+        effects.session.badge_design = BadgeDesign {
+            font: "Liberation Serif".into(),
+            bold: false,
+            caps: true,
+            size: 0.75,
+            position: 1,
+            style: 3,
+            layout: 1,
+            color: 4,
+            opacity: 0.25,
+            margin: 0.5,
+        };
+        let config = effects.worker_config();
+        assert!(config.contains("badge_position=top-center\n"));
+        assert!(config.contains("badge_style=block\n"));
+        assert!(config.contains("badge_accent=255,184,92\n"));
+        assert!(config.contains("badge_font=Liberation Serif\n"));
+        let restored = BadgeDesign::from_values(&parse_lines(&config));
+        assert_eq!(restored, effects.session.badge_design);
+        // Unknown values fall back to the defaults.
+        let odd = BadgeDesign::from_values(&parse_lines(
+            "badge_style=neon\nbadge_accent=1,2,3\nbadge_size=9",
+        ));
+        assert_eq!((odd.style, odd.color, odd.size), (0, 0, 1.0));
     }
 
     #[test]

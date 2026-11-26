@@ -171,6 +171,163 @@ pub fn swatch_tile(
     response.on_hover_cursor(CursorIcon::PointingHand)
 }
 
+/// A tile showing a picture thumbnail, used for backgrounds.
+pub fn image_tile(
+    ui: &mut Ui,
+    size: Vec2,
+    texture: Option<&egui::TextureHandle>,
+    label: &str,
+    selected: bool,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, selected, label));
+    if ui.is_rect_visible(rect) {
+        tile_frame(ui, rect, &response, selected);
+        let picture = Rect::from_min_max(
+            rect.min + Vec2::splat(5.0),
+            Pos2::new(rect.right() - 5.0, rect.bottom() - 22.0),
+        );
+        match texture {
+            Some(texture) => {
+                egui::Image::new(texture)
+                    .corner_radius(6)
+                    .paint_at(ui, picture);
+            }
+            None => {
+                ui.painter()
+                    .rect_filled(picture, 6.0, Color32::from_rgb(20, 24, 36));
+            }
+        }
+        if selected {
+            ui.painter()
+                .circle_filled(picture.center(), 11.0, Color32::from_black_alpha(150));
+            ui.painter().text(
+                picture.center(),
+                Align2::CENTER_CENTER,
+                "✔",
+                FontId::proportional(14.0),
+                Color32::WHITE,
+            );
+        }
+        ui.painter().text(
+            Pos2::new(rect.center().x, rect.bottom() - 11.5),
+            Align2::CENTER_CENTER,
+            label,
+            FontId::proportional(10.5),
+            if selected { TEXT } else { TEXT_MUTED },
+        );
+    }
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// A small picture of the screen with six spots — the top and bottom
+/// corners and centres. Click one to choose where something sits.
+/// `selected` indexes the spots row by row, top-left first.
+pub fn position_picker(ui: &mut Ui, selected: &mut usize) -> bool {
+    let size = Vec2::new(128.0, 72.0);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 8.0, Color32::from_rgb(14, 17, 27));
+    painter.rect_stroke(
+        rect,
+        8.0,
+        Stroke::new(1.0_f32, CARD_BORDER),
+        StrokeKind::Inside,
+    );
+    let mut changed = false;
+    for index in 0..6 {
+        let (column, row) = (index % 3, index / 3);
+        let spot = Vec2::new(34.0, 16.0);
+        let x = match column {
+            0 => rect.left() + 7.0,
+            1 => rect.center().x - spot.x / 2.0,
+            _ => rect.right() - spot.x - 7.0,
+        };
+        let y = if row == 0 {
+            rect.top() + 7.0
+        } else {
+            rect.bottom() - spot.y - 7.0
+        };
+        let spot_rect = Rect::from_min_size(Pos2::new(x, y), spot);
+        let response = ui
+            .interact(
+                spot_rect,
+                ui.id().with(("badge-spot", index)),
+                Sense::click(),
+            )
+            .on_hover_cursor(CursorIcon::PointingHand);
+        response.widget_info(|| {
+            WidgetInfo::selected(
+                WidgetType::RadioButton,
+                true,
+                *selected == index,
+                format!("Position {}", index + 1),
+            )
+        });
+        let color = if *selected == index {
+            ACCENT
+        } else if response.hovered() {
+            TILE_HOVER
+        } else {
+            TILE
+        };
+        ui.painter().rect_filled(spot_rect, 4.0, color);
+        if response.clicked() && *selected != index {
+            *selected = index;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// A label with an on/off switch at the right edge. Returns true if toggled.
+pub fn switch_row(ui: &mut Ui, label: &str, on: &mut bool) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).size(12.0));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            changed = toggle(ui, on, label).changed();
+        });
+    });
+    changed
+}
+
+/// Four draggable corner handles over the picture in `rect`, joined by an
+/// outline. `corners` are x, y pairs in 0..1 (top-left, top-right,
+/// bottom-right, bottom-left). Returns true while a handle is being moved.
+pub fn corner_handles(ui: &mut Ui, rect: Rect, corners: &mut [f32; 8]) -> bool {
+    let mut moved = false;
+    let position = |corners: &[f32; 8], index: usize| {
+        Pos2::new(
+            rect.left() + corners[index * 2] * rect.width(),
+            rect.top() + corners[index * 2 + 1] * rect.height(),
+        )
+    };
+    for index in 0..4 {
+        let center = position(corners, index);
+        let handle = Rect::from_center_size(center, Vec2::splat(30.0));
+        let response = ui
+            .interact(handle, ui.id().with(("corner", index)), Sense::drag())
+            .on_hover_cursor(CursorIcon::Grab);
+        if let Some(pointer) = response.interact_pointer_pos() {
+            corners[index * 2] = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            corners[index * 2 + 1] = ((pointer.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+            moved = true;
+        }
+    }
+    let painter = ui.painter_at(rect.expand(12.0));
+    let points: Vec<Pos2> = (0..4).map(|index| position(corners, index)).collect();
+    painter.add(Shape::closed_line(
+        points.clone(),
+        Stroke::new(2.0_f32, ACCENT_HOVER),
+    ));
+    for point in points {
+        painter.circle_filled(point, 8.0, Color32::WHITE);
+        painter.circle_stroke(point, 8.0, Stroke::new(2.5_f32, ACCENT));
+    }
+    moved
+}
+
 /// A round colour chip; `None` draws the "no colour" option.
 pub fn color_dot(ui: &mut Ui, color: Option<[u8; 3]>, label: &str, selected: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());

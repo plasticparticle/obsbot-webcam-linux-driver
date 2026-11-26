@@ -431,10 +431,11 @@ def heart_pink() -> Sprite:
 
 
 @cache
-def star() -> Sprite:
+def star(color: str = "gold") -> Sprite:
+    light, fill, _ = _shades(color, "gold")
     art = Art(110, 110)
-    art.poly(star_points(55, 58, 52, 23), (30, 150, 235))
-    art.poly(star_points(55, 58, 44, 19), (120, 240, 255), (40, 190, 250))
+    art.poly(star_points(55, 58, 52, 23), tuple(np.array(fill) * 0.75))
+    art.poly(star_points(55, 58, 44, 19), light, fill)
     art.ellipse(44, 44, 8, 5, WHITE, angle=-30, opacity=0.7, soften=1.2)
     return art.finish()
 
@@ -445,6 +446,97 @@ def sparkle() -> Sprite:
     points = star_points(50, 50, 48, 9, tips=4)
     art.paint(art.poly_mask(points), (150, 240, 255), opacity=0.7, soften=3.0)
     art.poly(points, WHITE)
+    return art.finish()
+
+
+@cache
+def clapping_hands() -> Sprite:
+    art = Art(200, 200)
+    skin, shade, line = (95, 200, 255), (50, 160, 240), (30, 110, 200)
+    # Motion lines above the hands.
+    for x0, y0, x1, y1 in ((100, 34, 100, 8), (64, 44, 50, 20), (136, 44, 150, 20)):
+        art.stroke([(x0, y0), (x1, y1)], 7, (70, 190, 255))
+
+    def hand(tilt: float, shift: float, front: bool) -> None:
+        cos, sin = np.cos(np.radians(tilt)), np.sin(np.radians(tilt))
+
+        def place(points):
+            pts = np.asarray(points, np.float32) - (100.0, 190.0)
+            turned = np.stack([pts[:, 0] * cos - pts[:, 1] * sin, pts[:, 0] * sin + pts[:, 1] * cos], axis=1)
+            return turned + (100.0 + shift, 190.0)
+
+        outline = smooth([(72, 186), (66, 120), (70, 62), (84, 52), (100, 50), (116, 52),
+                          (130, 62), (134, 120), (128, 186), (100, 194)], 8)
+        art.poly(place(outline), line)
+        inner = smooth([(77, 182), (72, 120), (76, 66), (88, 58), (100, 56), (112, 58),
+                        (124, 66), (128, 120), (123, 182), (100, 188)], 8)
+        art.poly(place(inner), skin if front else shade, shade)
+        for x in (88, 100, 112):
+            art.stroke(place([(x, 62), (x, 104)]), 3, line, opacity=0.55)
+        thumb = smooth([(128, 150), (146, 118), (156, 122), (150, 150), (134, 172)], 8)
+        if front:
+            art.poly(place(thumb), line)
+            art.poly(place(smooth([(131, 150), (146, 124), (151, 127), (146, 148), (135, 166)], 8)), skin)
+
+    hand(20.0, -12.0, False)
+    hand(-20.0, 12.0, True)
+    return art.finish()
+
+
+FIREWORK_COLORS = ((90, 110, 255), (80, 220, 255), (255, 190, 90), (230, 120, 255), (140, 255, 150), (255, 255, 255))
+
+
+@cache
+def spark(color: tuple[int, int, int]) -> Sprite:
+    """A glowing dot for fireworks, in BGR `color`."""
+    art = Art(48, 48)
+    art.paint(art.ellipse_mask(24, 24, 20, 20), color, opacity=0.5, soften=4.0)
+    art.ellipse(24, 24, 9, 9, color)
+    art.ellipse(24, 24, 5, 5, WHITE, opacity=0.85, soften=1.0)
+    return art.finish()
+
+
+# BGR colours for the question marks and stars; the keys match the GUI.
+MAGIC_COLORS = {
+    "blue": (255, 190, 120), "gold": (60, 205, 255), "pink": (200, 130, 255), "green": (120, 225, 110),
+    "purple": (255, 120, 180), "red": (80, 80, 245), "orange": (50, 150, 255), "white": (245, 245, 245),
+}
+
+
+def _shades(name: str, fallback: str) -> tuple[tuple, tuple, tuple]:
+    """(light, base, dark) BGR shades of a named magic colour."""
+    base = np.array(MAGIC_COLORS.get(name, MAGIC_COLORS[fallback]), np.float32)
+    light = base + (255.0 - base) * 0.55
+    dark = base * 0.45
+    return tuple(light), tuple(base), tuple(dark)
+
+
+@cache
+def question_mark(color: str = "blue") -> Sprite:
+    _, fill, edge = _shades(color, "blue")
+    art = Art(120, 180)
+    hook = smooth([(34, 58), (40, 30), (62, 20), (84, 30), (88, 54), (74, 76), (62, 92), (60, 116)], 10, closed=False)
+    art.stroke(hook, 30, edge)
+    art.ellipse(60, 150, 18, 18, edge)
+    art.stroke(hook, 19, fill)
+    art.ellipse(60, 150, 12, 12, fill)
+    art.stroke(smooth([(42, 44), (50, 30), (62, 27)], 6, closed=False), 5, WHITE, opacity=0.7)
+    return art.finish()
+
+
+@cache
+def light_bulb() -> Sprite:
+    art = Art(160, 220)
+    art.paint(art.ellipse_mask(80, 84, 76, 76), (120, 235, 255), opacity=0.55, soften=10.0)
+    glass = smooth([(80, 22), (124, 40), (136, 84), (112, 126), (106, 150), (54, 150), (48, 126), (24, 84), (36, 40)], 10)
+    art.poly(glass, (40, 170, 245))
+    inner = smooth([(80, 30), (118, 46), (128, 84), (106, 122), (100, 144), (60, 144), (54, 122), (32, 84), (42, 46)], 10)
+    art.poly(inner, (170, 250, 255), (60, 215, 255))
+    art.stroke([(66, 140), (70, 96), (80, 112), (90, 96), (94, 140)], 4, (40, 150, 240))
+    art.ellipse(58, 62, 12, 20, WHITE, angle=30, opacity=0.75, soften=2.0)
+    for y in (158, 172, 186):
+        art.stroke([(58, y), (102, y)], 10, (150, 140, 135))
+    art.ellipse(80, 198, 14, 8, (90, 84, 82))
     return art.finish()
 
 

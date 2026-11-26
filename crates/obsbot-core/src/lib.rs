@@ -10,6 +10,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
+pub mod app_ipc;
 pub mod xu;
 pub use xu::{AiMode, Fov, Status, TrackingSpeed};
 
